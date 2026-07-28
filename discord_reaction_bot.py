@@ -477,6 +477,7 @@ class DiscordSignalClient(discord.Client):
             reacting_user_id=reacting_user_id,
             tip=tip,
             raw_message=text,
+            source_bookmaker_name=signal.source_bookmaker,
         )
         if not inserted:
             logger.info("Sinal Discord duplicado ignorado apos enqueue: source_bet_id=%s", source_bet_id)
@@ -523,11 +524,6 @@ class DiscordSignalClient(discord.Client):
             logger.info("DM de confirmacao enviada para admin=%s source_bet_id=%s.", self._settings.admin_user_id, tip.source_bet_id)
         except Exception:
             logger.exception("Falha ao enviar DM de confirmacao no Discord para source_bet_id=%s.", tip.source_bet_id)
-            await self._alert_async(
-                "Falha ao enviar DM de confirmacao do Discord",
-                f"source_bet_id={tip.source_bet_id}",
-                f"discord_dm_confirm_{tip.source_bet_id}",
-            )
 
     async def _notify_success(
         self,

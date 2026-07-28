@@ -63,6 +63,7 @@ class _LocalCandidate:
     event_norm: str
     pick_norm: str
     bookmaker_norm: str
+    source_bookmaker: str
 
 
 class PeixeEspertoResultSync:
@@ -149,8 +150,11 @@ class PeixeEspertoResultSync:
                 ignored += 1
                 continue
 
-            key = self._local_index_key(peixe_bet.event, peixe_bet.pick, peixe_bet.bookmaker)
-            matches = local_index.get(key, [])
+            matches_by_job: dict[int, _LocalCandidate] = {}
+            for key in self._local_index_keys(peixe_bet.event, peixe_bet.pick, peixe_bet.bookmaker):
+                for match in local_index.get(key, []):
+                    matches_by_job[match.job_id] = match
+            matches = list(matches_by_job.values())
             matches = [m for m in matches if m.bet_analytix_bet_id not in updated_bet_ids]
 
             if len(matches) == 0:
@@ -211,6 +215,7 @@ class PeixeEspertoResultSync:
             # O bot armazena tip.pick como "Evento: Aposta" para exibicao no Bet-Analytix.
             # No matching usamos apenas a parte da aposta, sem o evento.
             real_pick = _extract_pick_from_label(tip.pick, tip.event)
+            source_bookmaker = str(job["source_bookmaker_name"] or tip.bookmaker)
             candidate = _LocalCandidate(
                 job_id=int(job["id"]),
                 source_bet_id=int(job["source_bet_id"]),
@@ -223,9 +228,15 @@ class PeixeEspertoResultSync:
                 bookmaker_norm=_bookmaker_canonical(
                     tip.bookmaker, self._bookmaker_equivalence
                 ),
+                source_bookmaker=source_bookmaker,
             )
-            key = (candidate.event_norm, candidate.pick_norm, candidate.bookmaker_norm)
-            index.setdefault(key, []).append(candidate)
+            bookmaker_keys = _bookmaker_match_keys(tip.bookmaker, self._bookmaker_equivalence)
+            bookmaker_keys.update(
+                _bookmaker_match_keys(source_bookmaker, self._bookmaker_equivalence)
+            )
+            for bookmaker_key in bookmaker_keys:
+                key = (candidate.event_norm, candidate.pick_norm, bookmaker_key)
+                index.setdefault(key, []).append(candidate)
 
         # Loga conflitos locais para facilitar debug
         for key, candidates in index.items():
@@ -239,14 +250,17 @@ class PeixeEspertoResultSync:
 
         return index
 
-    def _local_index_key(
+    def _local_index_keys(
         self, event: str, pick: str, bookmaker: str
-    ) -> tuple[str, str, str]:
-        return (
-            _normalize_match_text(event),
-            _normalize_match_text(pick),
-            _bookmaker_canonical(bookmaker, self._bookmaker_equivalence),
-        )
+    ) -> set[tuple[str, str, str]]:
+        event_norm = _normalize_match_text(event)
+        pick_norm = _normalize_match_text(pick)
+        return {
+            (event_norm, pick_norm, bookmaker_key)
+            for bookmaker_key in _bookmaker_match_keys(
+                bookmaker, self._bookmaker_equivalence
+            )
+        }
 
     def _fetch_recent_results(self) -> list[PeixeEspertoBet]:
         """Busca paginas recentes de resultados do PeixeEsperto.
@@ -475,21 +489,39 @@ def _build_bookmaker_equivalence(
 
     equivalence: dict[str, str] = {}
     for original, mapped in aliases.items():
-        canonical = _normalize_match_text(mapped)
+        canonical = _normalize_bookmaker_text(mapped)
         for name in (original, mapped):
-            equivalence[_normalize_match_text(name)] = canonical
-            # Adiciona versao lowercase sem normalizacao de acentos, caso ja exista
-            equivalence[name.lower().strip()] = canonical
+            equivalence[_normalize_bookmaker_text(name)] = canonical
     return equivalence
 
 
 def _bookmaker_canonical(name: str, equivalence: dict[str, str]) -> str:
     """Retorna nome canonico da casa para matching."""
 
-    normalized = _normalize_match_text(name)
+    normalized = _normalize_bookmaker_text(name)
     if normalized in equivalence:
         return equivalence[normalized]
     return normalized
+
+
+def _normalize_bookmaker_text(value: str) -> str:
+    """Normaliza casa removendo acentos, espacos e pontuacao."""
+
+    return "".join(char for char in _normalize_match_text(value) if char.isalnum())
+
+
+def _bookmaker_match_keys(name: str, equivalence: dict[str, str]) -> set[str]:
+    """Gera chaves equivalentes por alias e pela presenca do sufixo ``bet``."""
+
+    canonical = _bookmaker_canonical(name, equivalence)
+    keys = {canonical}
+    if canonical.endswith("bet") and len(canonical) > 3:
+        without_bet = canonical[:-3]
+        if len(without_bet) >= 3:
+            keys.add(without_bet)
+    elif len(canonical) >= 3:
+        keys.add(f"{canonical}bet")
+    return keys
 
 
 def _parse_datetime(value: str) -> datetime:

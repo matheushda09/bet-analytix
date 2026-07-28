@@ -16,6 +16,7 @@ class ExternalBetSignal:
     """Sinal externo normalizado antes de virar aposta Bet-Analytix."""
 
     bookmaker: str
+    source_bookmaker: str
     event: str
     sport: str
     pick: str
@@ -92,12 +93,13 @@ def parse_external_signal(
     header = _required_header(text)
     _validate_header_layout(header)
 
-    bookmaker = _required(header, "bookmaker")
+    source_bookmaker = _required(header, "bookmaker")
     event = _required_event(header)
-    bookmaker = (bookmaker_aliases or {}).get(bookmaker, bookmaker)
+    bookmaker = _resolve_bookmaker_alias(source_bookmaker, bookmaker_aliases or {})
 
     return ExternalBetSignal(
         bookmaker=bookmaker,
+        source_bookmaker=source_bookmaker,
         event=event,
         sport=_required(header, "sport"),
         pick=_required(header, "pick"),
@@ -112,6 +114,22 @@ def parse_external_signal(
         raw_text=text,
         event_datetime=_parse_event_datetime(text),
     )
+
+
+def _resolve_bookmaker_alias(bookmaker: str, aliases: dict[str, str]) -> str:
+    """Resolve alias sem diferenciar maiusculas, minusculas, acentos ou pontuacao."""
+
+    normalized_bookmaker = _normalize_bookmaker_name(bookmaker)
+    for original, mapped in aliases.items():
+        if _normalize_bookmaker_name(original) == normalized_bookmaker:
+            return mapped
+    return bookmaker
+
+
+def _normalize_bookmaker_name(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value).casefold())
+    without_marks = "".join(char for char in normalized if not unicodedata.combining(char))
+    return "".join(char for char in without_marks if char.isalnum())
 
 
 def is_external_signal_message(

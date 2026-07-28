@@ -638,11 +638,36 @@ class BetAnalytixWriter:
         if bookmaker_id is not None:
             return bookmaker_id
 
+        bet_variant_id = self._resolve_bookmaker_id_bet_variant(bookmaker_name, normalized_input)
+        if bet_variant_id is not None:
+            return bet_variant_id
+
         fuzzy_id = self._resolve_bookmaker_id_fuzzy(bookmaker_name, normalized_input)
         if fuzzy_id is not None:
             return fuzzy_id
 
         raise BetAnalytixWriterError(f"Casa não encontrada no catálogo do Bet-Analytix: {bookmaker_name}")
+
+    def _resolve_bookmaker_id_bet_variant(self, bookmaker_name: str, normalized_input: str) -> int | None:
+        """Tenta equivalencia exata adicionando ou removendo o sufixo ``bet``."""
+
+        if not self._bookmakers_by_name:
+            return None
+
+        variants = _bookmaker_bet_variants(normalized_input)
+        variants.discard(normalized_input)
+        for variant in variants:
+            matched_id = self._bookmakers_by_name.get(variant)
+            if matched_id is None:
+                continue
+            logger.info(
+                "Match de casa por variacao BET: '%s' -> '%s' (id=%s).",
+                bookmaker_name,
+                variant,
+                matched_id,
+            )
+            return matched_id
+        return None
 
     def _resolve_bookmaker_id_fuzzy(self, bookmaker_name: str, normalized_input: str) -> int | None:
         """Tenta encontrar a casa mais proxima usando fuzzy matching.
@@ -1148,6 +1173,19 @@ def _bookmaker_id_from_text(value: str) -> int | None:
     if not cleaned.isdigit():
         return None
     return int(cleaned)
+
+
+def _bookmaker_bet_variants(normalized_name: str) -> set[str]:
+    """Retorna o nome e sua forma exata alternativa com/sem sufixo ``bet``."""
+
+    variants = {normalized_name}
+    if normalized_name.endswith("bet") and len(normalized_name) > 3:
+        without_bet = normalized_name[:-3]
+        if len(without_bet) >= 3:
+            variants.add(without_bet)
+    elif len(normalized_name) >= 3:
+        variants.add(f"{normalized_name}bet")
+    return variants
 
 
 def _bet_analytix_timestamp(event_date: str, event_time: str) -> int:

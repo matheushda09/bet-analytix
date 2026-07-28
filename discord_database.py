@@ -43,6 +43,7 @@ class DiscordSignalStore:
                     message_id INTEGER NOT NULL,
                     signal_sender_id INTEGER NOT NULL,
                     reacting_user_id INTEGER NOT NULL,
+                    source_bookmaker_name TEXT,
                     source_bet_id INTEGER NOT NULL UNIQUE,
                     payload_json TEXT NOT NULL,
                     raw_message TEXT NOT NULL,
@@ -58,6 +59,10 @@ class DiscordSignalStore:
                 )
                 """
             )
+            try:
+                connection.execute("ALTER TABLE discord_signal_jobs ADD COLUMN source_bookmaker_name TEXT")
+            except sqlite3.OperationalError:
+                pass
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_discord_signal_jobs_due
@@ -214,6 +219,7 @@ class DiscordSignalStore:
         reacting_user_id: int,
         tip: ParsedTelegramTip,
         raw_message: str,
+        source_bookmaker_name: str | None = None,
     ) -> bool:
         """Insere um sinal na fila; retorna `False` quando for duplicado."""
 
@@ -228,6 +234,7 @@ class DiscordSignalStore:
                     message_id,
                     signal_sender_id,
                     reacting_user_id,
+                    source_bookmaker_name,
                     source_bet_id,
                     payload_json,
                     raw_message,
@@ -237,7 +244,7 @@ class DiscordSignalStore:
                     created_at_ts,
                     updated_at_ts
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
                 """,
                 (
                     str(guild_id),
@@ -245,6 +252,7 @@ class DiscordSignalStore:
                     message_id,
                     signal_sender_id,
                     reacting_user_id,
+                    source_bookmaker_name,
                     tip.source_bet_id,
                     payload_json,
                     raw_message,
