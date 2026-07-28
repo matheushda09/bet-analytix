@@ -478,6 +478,7 @@ class DiscordSignalClient(discord.Client):
             tip=tip,
             raw_message=text,
             source_bookmaker_name=signal.source_bookmaker,
+            source_tipster_name=signal.admin,
         )
         if not inserted:
             logger.info("Sinal Discord duplicado ignorado apos enqueue: source_bet_id=%s", source_bet_id)

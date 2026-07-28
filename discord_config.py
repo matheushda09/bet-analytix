@@ -171,6 +171,7 @@ class PeixeEspertoSettings:
     sync_max_age_hours: int
     sync_per_page: int
     sync_max_pages: int
+    timezone_name: str
 
 
 def load_peixeesperto_settings(env_path: str | Path = ".env") -> PeixeEspertoSettings:
@@ -184,6 +185,7 @@ def load_peixeesperto_settings(env_path: str | Path = ".env") -> PeixeEspertoSet
         sync_max_age_hours=_get_int("PEIXEESPERTO_SYNC_MAX_AGE_HOURS", 72),
         sync_per_page=_get_int("PEIXEESPERTO_SYNC_PER_PAGE", 50),
         sync_max_pages=_get_int("PEIXEESPERTO_SYNC_MAX_PAGES", 10),
+        timezone_name=_get_str("APP_TIMEZONE", "America/Sao_Paulo"),
     )
 
 

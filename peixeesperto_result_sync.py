@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlencode
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
@@ -42,6 +45,7 @@ class PeixeEspertoBet:
     event: str
     pick: str
     bookmaker: str
+    tipster: str
     sport: str
     odd: float
     stake: float
@@ -64,6 +68,7 @@ class _LocalCandidate:
     pick_norm: str
     bookmaker_norm: str
     source_bookmaker: str
+    source_tipster: str | None
 
 
 class PeixeEspertoResultSync:
@@ -137,7 +142,22 @@ class PeixeEspertoResultSync:
             logger.debug("Nenhum candidato local valido para sincronizacao.")
             return 0, 0, 0, 0
 
-        peixe_bets = self._fetch_recent_results()
+        source_tipsters_by_job = [
+            _source_tipster_from_job(job)
+            for job in pending_jobs
+        ]
+        source_tipsters = {
+            source_tipster
+            for source_tipster in source_tipsters_by_job
+            if source_tipster
+        }
+        peixe_bets = self._fetch_recent_results(
+            source_tipsters,
+            include_unfiltered=any(
+                source_tipster is None
+                for source_tipster in source_tipsters_by_job
+            ),
+        )
 
         updated = 0
         ambiguous = 0
@@ -156,19 +176,32 @@ class PeixeEspertoResultSync:
                     matches_by_job[match.job_id] = match
             matches = list(matches_by_job.values())
             matches = [m for m in matches if m.bet_analytix_bet_id not in updated_bet_ids]
+            matches = [
+                match
+                for match in matches
+                if _tipsters_compatible(match.source_tipster, peixe_bet.tipster)
+            ]
 
             if len(matches) == 0:
                 continue
             if len(matches) > 1:
-                logger.warning(
-                    "PeixeEsperto message_id=%s (%s / %s) tem %s correspondencias validas; pulando.",
-                    peixe_bet.message_id,
-                    peixe_bet.event,
-                    peixe_bet.pick,
-                    len(matches),
-                )
-                ambiguous += 1
-                continue
+                narrowed_matches = _narrow_by_odd_and_stake(matches, peixe_bet)
+                if len(narrowed_matches) == 1:
+                    matches = narrowed_matches
+                    logger.info(
+                        "PeixeEsperto message_id=%s desambiguada com odd/stake.",
+                        peixe_bet.message_id,
+                    )
+                else:
+                    logger.warning(
+                        "PeixeEsperto message_id=%s (%s / %s) tem %s correspondencias validas; pulando.",
+                        peixe_bet.message_id,
+                        peixe_bet.event,
+                        peixe_bet.pick,
+                        len(matches),
+                    )
+                    ambiguous += 1
+                    continue
 
             candidate = matches[0]
             result = self._apply_result(peixe_bet, candidate)
@@ -216,6 +249,7 @@ class PeixeEspertoResultSync:
             # No matching usamos apenas a parte da aposta, sem o evento.
             real_pick = _extract_pick_from_label(tip.pick, tip.event)
             source_bookmaker = str(job["source_bookmaker_name"] or tip.bookmaker)
+            source_tipster = _source_tipster_from_job(job)
             candidate = _LocalCandidate(
                 job_id=int(job["id"]),
                 source_bet_id=int(job["source_bet_id"]),
@@ -229,6 +263,7 @@ class PeixeEspertoResultSync:
                     tip.bookmaker, self._bookmaker_equivalence
                 ),
                 source_bookmaker=source_bookmaker,
+                source_tipster=source_tipster,
             )
             bookmaker_keys = _bookmaker_match_keys(tip.bookmaker, self._bookmaker_equivalence)
             bookmaker_keys.update(
@@ -262,66 +297,102 @@ class PeixeEspertoResultSync:
             )
         }
 
-    def _fetch_recent_results(self) -> list[PeixeEspertoBet]:
+    def _fetch_recent_results(
+        self,
+        source_tipsters: set[str] | None = None,
+        include_unfiltered: bool = False,
+    ) -> list[PeixeEspertoBet]:
         """Busca paginas recentes de resultados do PeixeEsperto.
 
         Para de buscar quando:
         - Encontra apostas mais antigas que o cutoff configurado;
         - Alcanca o maximo de paginas;
-        - Encontra message_ids ja sincronizados em todas as apostas da pagina.
+
+        Quando os tipsters de origem sao conhecidos, consulta cada um
+        separadamente para evitar que apostas de outros tipsters ocupem as
+        primeiras paginas da API.
         """
 
-        results: list[PeixeEspertoBet] = []
+        results_by_message_id: dict[int, PeixeEspertoBet] = {}
         cutoff_ts = time.time() - self._settings.sync_max_age_hours * 3600
         already_synced = self._store.get_synced_message_ids()
+        tipster_filters: list[str | None] = sorted(source_tipsters or set())
+        if include_unfiltered or not tipster_filters:
+            tipster_filters.append(None)
 
-        for page in range(1, self._settings.sync_max_pages + 1):
-            url = (
-                f"{_PEIXEESPERTO_BASE_URL}/api/grupo/{self._settings.group_slug}/apostas"
-                f"?sort_by=Data&sort_order=desc"
-                f"&page={page}"
-                f"&per_page={self._settings.sync_per_page}"
-            )
-            data = self._get_with_retry(url)
-            if data is None:
-                break
+        now_utc = datetime.now(timezone.utc)
+        safe_start_date = (
+            now_utc - timedelta(hours=self._settings.sync_max_age_hours, days=1)
+        ).strftime("%Y-%m-%d")
+        safe_end_date = (now_utc + timedelta(days=1)).strftime("%Y-%m-%d")
 
-            apostas = data.get("apostas") if isinstance(data, dict) else None
-            if not isinstance(apostas, list):
-                logger.warning("Resposta inesperada do PeixeEsperto na pagina %s: %r", page, data)
-                break
+        for tipster_filter in tipster_filters:
+            for page in range(1, self._settings.sync_max_pages + 1):
+                params = {
+                    "sort_by": "Data",
+                    "sort_order": "desc",
+                    "page": page,
+                    "per_page": self._settings.sync_per_page,
+                    "start_date": safe_start_date,
+                    "end_date": safe_end_date,
+                    "estado": ",".join(_STATE_MAP),
+                }
+                if tipster_filter:
+                    params["tipster"] = tipster_filter
+                url = (
+                    f"{_PEIXEESPERTO_BASE_URL}/api/grupo/{self._settings.group_slug}/apostas"
+                    f"?{urlencode(params)}"
+                )
+                data = self._get_with_retry(url)
+                if data is None:
+                    break
 
-            if not apostas:
-                break
+                apostas = data.get("apostas") if isinstance(data, dict) else None
+                if not isinstance(apostas, list):
+                    logger.warning("Resposta inesperada do PeixeEsperto na pagina %s: %r", page, data)
+                    break
 
-            all_old_or_synced = True
-            for raw in apostas:
-                bet = self._parse_peixe_bet(raw)
-                if bet is None:
-                    continue
-                if bet.message_id in already_synced:
-                    continue
-                try:
-                    bet_ts = _parse_datetime(bet.raw.get("Data") or "").timestamp()
-                except ValueError:
-                    logger.warning("Data invalida no PeixeEsperto message_id=%s; ignorando.", bet.message_id)
-                    continue
-                if bet_ts < cutoff_ts:
-                    continue
-                all_old_or_synced = False
-                if bet.estado in _STATE_MAP:
-                    results.append(bet)
+                if not apostas:
+                    break
 
-            if all_old_or_synced:
-                logger.info("PeixeEsperto sync: pagina %s so continha apostas antigas/ja sincronizadas; parando.", page)
-                break
+                page_has_valid_date = False
+                page_is_entirely_old = True
+                for raw in apostas:
+                    bet = self._parse_peixe_bet(raw)
+                    if bet is None:
+                        page_is_entirely_old = False
+                        continue
+                    try:
+                        bet_ts = _parse_datetime(
+                            bet.raw.get("Data") or "",
+                            getattr(self._settings, "timezone_name", "America/Sao_Paulo"),
+                        ).timestamp()
+                    except ValueError:
+                        logger.warning("Data invalida no PeixeEsperto message_id=%s; ignorando.", bet.message_id)
+                        page_is_entirely_old = False
+                        continue
+                    page_has_valid_date = True
+                    if bet_ts >= cutoff_ts:
+                        page_is_entirely_old = False
+                    if bet_ts < cutoff_ts or bet.message_id in already_synced:
+                        continue
+                    if bet.estado in _STATE_MAP:
+                        results_by_message_id[bet.message_id] = bet
 
-            current_page = data.get("current_page") if isinstance(data, dict) else page
-            total_pages = data.get("pages") if isinstance(data, dict) else page
-            if current_page >= total_pages:
-                break
+                if page_has_valid_date and page_is_entirely_old:
+                    logger.info(
+                        "PeixeEsperto sync: pagina %s de tipster=%s so continha apostas antigas; parando.",
+                        page,
+                        tipster_filter or "*",
+                    )
+                    break
 
-        return results
+                current_page = data.get("current_page") if isinstance(data, dict) else page
+                total_pages = data.get("pages") if isinstance(data, dict) else page
+                if current_page >= total_pages:
+                    break
+
+        return list(results_by_message_id.values())
 
     def _get_with_retry(self, url: str, max_retries: int = 2) -> dict[str, Any] | None:
         """Faz GET na API do PeixeEsperto com retry simples."""
@@ -354,6 +425,7 @@ class PeixeEspertoResultSync:
                 event=str(raw.get("Jogo") or "").strip(),
                 pick=str(raw.get("Aposta") or "").strip(),
                 bookmaker=str(raw.get("Casa") or "").strip(),
+                tipster=str(raw.get("Tipster") or "").strip(),
                 sport=str(raw.get("Esporte") or "").strip(),
                 odd=float(str(raw.get("Odd") or "0").replace(",", ".")),
                 stake=float(str(raw.get("Valor") or "0").replace(",", ".")),
@@ -524,12 +596,64 @@ def _bookmaker_match_keys(name: str, equivalence: dict[str, str]) -> set[str]:
     return keys
 
 
-def _parse_datetime(value: str) -> datetime:
+def _source_tipster_from_job(job: Any) -> str | None:
+    """Recupera o ADM preservado ou extrai o legado da mensagem bruta."""
+
+    try:
+        stored = str(job["source_tipster_name"] or "").strip()
+    except (IndexError, KeyError):
+        stored = ""
+    if stored:
+        return stored
+
+    try:
+        raw_message = str(job["raw_message"] or "")
+    except (IndexError, KeyError):
+        return None
+    match = re.search(r"ADM\s*:\s*([^\r\n]+)", raw_message, re.IGNORECASE)
+    if not match:
+        return None
+    value = " ".join(match.group(1).strip().split())
+    return value or None
+
+
+def _normalize_tipster(value: str) -> str:
+    normalized = _normalize_match_text(value).lstrip("@")
+    return "".join(char for char in normalized if char.isalnum())
+
+
+def _tipsters_compatible(source_tipster: str | None, api_tipster: str) -> bool:
+    """Exige igualdade quando ambos os lados informam o tipster."""
+
+    if not source_tipster or not api_tipster:
+        return True
+    return _normalize_tipster(source_tipster) == _normalize_tipster(api_tipster)
+
+
+def _narrow_by_odd_and_stake(
+    matches: list[_LocalCandidate],
+    peixe_bet: PeixeEspertoBet,
+) -> list[_LocalCandidate]:
+    """Desempata apenas quando odd e stake apontam para um unico candidato."""
+
+    return [
+        match
+        for match in matches
+        if abs(match.odd - peixe_bet.odd) <= 0.005
+        and abs(match.stake - peixe_bet.stake) <= 0.01
+    ]
+
+
+def _parse_datetime(value: str, timezone_name: str = "America/Sao_Paulo") -> datetime:
     """Parseia datas no formato '2026-07-02 16:54:32'."""
 
+    try:
+        timezone_info = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        timezone_info = timezone.utc
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M"):
         try:
-            return datetime.strptime(value.strip(), fmt)
+            return datetime.strptime(value.strip(), fmt).replace(tzinfo=timezone_info)
         except ValueError:
             continue
     raise ValueError(f"Data invalida: {value!r}")
