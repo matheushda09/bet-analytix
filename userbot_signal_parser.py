@@ -73,6 +73,29 @@ PATTERNS: dict[str, re.Pattern[str]] = {
 SIGNAL_MARKER_PATTERN = re.compile(r"Jogue\s+com\s+responsabilidade", re.IGNORECASE)
 ODD_CHANGED_MARKER_PATTERN = re.compile(r"Odd\s+mudou\?\s+\[?Clique\s+AQUI\]?", re.IGNORECASE)
 FAIR_ODD_PATTERN = re.compile(r"Odd\s+justa\s*:\s*(?P<value>\d+(?:[.,]\d+)?)", re.IGNORECASE)
+OVERLOAD_TITLE_PATTERN = re.compile(r"^\s*SOBRECARGA\s*$", re.IGNORECASE)
+OVERLOAD_FIELD_LINES: dict[str, int] = {
+    "bookmaker": 1,
+    "event": 2,
+    "sport": 3,
+    "pick": 4,
+    "odd": 5,
+    "limit": 6,
+    "edge": 7,
+    "stake": 8,
+    "freebet": 9,
+    "admin": 10,
+}
+OVERLOAD_FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
+    "odd": re.compile(r"^\s*(?P<value>\d+(?:[.,]\d+)?)\s*$"),
+    "limit": re.compile(
+        r"^\s*Limite da aposta\s*:\s*(?P<value>[^\n\r]+?)\s*$",
+        re.IGNORECASE,
+    ),
+    "edge": re.compile(r"^\s*(?P<value>[\d.,]+\s*%)\s*$"),
+    "stake": re.compile(r"^\s*(?P<value>R\$\s*[\d.,]+|[\d.,]+)\s*$", re.IGNORECASE),
+    "admin": re.compile(r"^\s*ADM\s*:\s*(?P<value>[^\n\r]+?)\s*$", re.IGNORECASE),
+}
 
 
 def parse_external_signal(
@@ -202,6 +225,10 @@ def _required_header(text: str) -> str:
 
 
 def _validate_header_layout(header: str) -> None:
+    if _is_overload_header(header):
+        _validate_overload_header_layout(header)
+        return
+
     lines = header.splitlines()
     if len(lines) < 11:
         raise UserbotSignalParseError("Cabecalho incompleto para sinal.")
@@ -229,6 +256,9 @@ def _validate_header_layout(header: str) -> None:
 
 
 def _optional(text: str, field: str) -> str | None:
+    if _is_overload_header(text):
+        return _optional_overload_field(text, field)
+
     if field == "sport":
         return _optional_sport(text)
 
@@ -243,6 +273,9 @@ def _optional(text: str, field: str) -> str | None:
 def _optional_sport(text: str) -> str | None:
     """Extrai o esporte pela posicao estrutural, sem mapear emojis."""
 
+    if _is_overload_header(text):
+        return _optional_overload_field(text, "sport")
+
     lines = text.splitlines()
     event_index = _line_index(lines, PATTERNS["event"])
     pick_index = _line_index(lines, PATTERNS["pick"])
@@ -254,6 +287,73 @@ def _optional_sport(text: str) -> str | None:
     if not _looks_like_sport(sport):
         return None
     return sport
+
+
+def _is_overload_header(text: str) -> bool:
+    lines = text.splitlines()
+    return bool(lines and OVERLOAD_TITLE_PATTERN.fullmatch(lines[0]))
+
+
+def _validate_overload_header_layout(header: str) -> None:
+    """Valida o layout sem emojis identificado pelo titulo SOBRECARGA."""
+
+    lines = header.splitlines()
+    if len(lines) < 11:
+        raise UserbotSignalParseError("Cabecalho SOBRECARGA incompleto para sinal.")
+
+    for field, line_index in OVERLOAD_FIELD_LINES.items():
+        if not _optional_overload_field(header, field):
+            raise UserbotSignalParseError(
+                f"Cabecalho SOBRECARGA fora do padrao na linha {line_index + 1}: {field}"
+            )
+
+
+def _optional_overload_field(text: str, field: str) -> str | None:
+    line_index = OVERLOAD_FIELD_LINES.get(field)
+    if line_index is None:
+        return None
+
+    lines = text.splitlines()
+    if line_index >= len(lines):
+        return None
+
+    line = lines[line_index]
+    pattern = OVERLOAD_FIELD_PATTERNS.get(field)
+    if pattern is not None:
+        match = pattern.fullmatch(line)
+        if not match:
+            return None
+        value = " ".join(match.group("value").strip().split())
+    else:
+        value = " ".join(line.strip().split())
+
+    if not value:
+        return None
+    if field == "sport":
+        return value if _looks_like_sport(value) else None
+    if field in {"bookmaker", "event", "pick", "freebet"}:
+        return value if _looks_like_overload_value(value) else None
+    return value
+
+
+def _looks_like_overload_value(value: str) -> bool:
+    """Evita aceitar rotulos ou marcadores posteriores como campo posicional."""
+
+    normalized = value.casefold()
+    blocked_fragments = (
+        "sobrecarga",
+        "adm:",
+        "limite da aposta",
+        "odd justa",
+        "odd mudou",
+        "clique aqui",
+        "planilhar com shark track",
+        "http://",
+        "https://",
+    )
+    return any(char.isalnum() for char in value) and not any(
+        fragment in normalized for fragment in blocked_fragments
+    )
 
 
 def _line_index(lines: list[str], pattern: re.Pattern[str]) -> int | None:
