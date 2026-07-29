@@ -12,6 +12,7 @@ import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import discord
 
@@ -32,6 +33,9 @@ from discord_database import DiscordSignalStore, tip_from_payload
 from message_parser import ParsedTelegramTip
 from operational_alerts import OperationalAlerter
 from peixeesperto_result_sync import PeixeEspertoResultSync
+from sports_event_config import SportsEventSettings, load_sports_event_settings
+from sports_event_service import SportsEventService
+from sports_schedule_store import SportsScheduleStore
 from userbot_signal_parser import (
     ODD_CHANGED_MARKER_PATTERN,
     UserbotSignalParseError,
@@ -78,6 +82,8 @@ class DiscordSignalClient(discord.Client):
         bankroll_controller: BankrollController | None = None,
         peixeesperto_settings: PeixeEspertoSettings | None = None,
         peixeesperto_sync: PeixeEspertoResultSync | None = None,
+        sports_event_settings: SportsEventSettings | None = None,
+        sports_event_service: SportsEventService | None = None,
     ) -> None:
         super().__init__()
 
@@ -91,10 +97,13 @@ class DiscordSignalClient(discord.Client):
         self._bankroll_controller = bankroll_controller
         self._peixeesperto_settings = peixeesperto_settings
         self._peixeesperto_sync = peixeesperto_sync
+        self._sports_event_settings = sports_event_settings
+        self._sports_event_service = sports_event_service
         self._processor_task: asyncio.Task[None] | None = None
         self._bankroll_scheduler_task: asyncio.Task[None] | None = None
         self._green_sync_scheduler_task: asyncio.Task[None] | None = None
         self._peixeesperto_scheduler_task: asyncio.Task[None] | None = None
+        self._sports_event_recheck_task: asyncio.Task[None] | None = None
 
     async def setup_hook(self) -> None:
         """Inicializa tarefas de fundo depois que o cliente esta pronto."""
@@ -114,6 +123,15 @@ class DiscordSignalClient(discord.Client):
                 self._peixeesperto_result_sync_scheduler(),
                 name="peixeesperto-result-sync",
             )
+        if (
+            self._sports_event_settings is not None
+            and self._sports_event_settings.mode == "enabled"
+            and self._sports_event_service is not None
+        ):
+            self._sports_event_recheck_task = asyncio.create_task(
+                self._sports_event_recheck_scheduler(),
+                name="sports-event-recheck",
+            )
 
     async def close(self) -> None:
         """Encerra o cliente e as tarefas de fundo."""
@@ -130,6 +148,9 @@ class DiscordSignalClient(discord.Client):
         if self._peixeesperto_scheduler_task is not None:
             self._peixeesperto_scheduler_task.cancel()
             await _cancel_task(self._peixeesperto_scheduler_task)
+        if self._sports_event_recheck_task is not None:
+            self._sports_event_recheck_task.cancel()
+            await _cancel_task(self._sports_event_recheck_task)
         await super().close()
 
     async def on_ready(self) -> None:
@@ -145,6 +166,17 @@ class DiscordSignalClient(discord.Client):
             self._settings.admin_user_id,
             self._settings.destination_tipster_name,
         )
+        if self._sports_event_settings is not None:
+            logger.info(
+                "Sports event matching: mode=%s cache=%s providers=%s",
+                self._sports_event_settings.mode,
+                self._sports_event_settings.cache_path,
+                (
+                    ",".join(self._sports_event_service.available_providers)
+                    if self._sports_event_service is not None
+                    else "nenhum"
+                ),
+            )
         await self._alert_async(
             "DISCORD BOT ON",
             (
@@ -194,6 +226,16 @@ class DiscordSignalClient(discord.Client):
                     response = await asyncio.to_thread(self._writer.create_bet, tip)
                 created_id = _extract_created_bet_id(response)
                 self._store.mark_job_success(job_id, created_id, response)
+                if self._sports_event_service is not None:
+                    next_check = self._sports_event_service.next_recheck_timestamp(
+                        tip.event_datetime,
+                        None,
+                    )
+                    self._store.mark_sports_event_applied(
+                        source_bet_id,
+                        created_id,
+                        next_check,
+                    )
                 logger.info("Discord concluiu CopyTrade: source_bet_id=%s created_bet_id=%s", source_bet_id, created_id)
                 if attempts > 0:
                     await self._alert_async(
@@ -440,6 +482,8 @@ class DiscordSignalClient(discord.Client):
             return
 
         source_bet_id = build_source_bet_id(guild_id, channel_id, message_id)
+        fallback_datetime_utc = _message_datetime(message.created_at)
+        sports_event_audit: dict[str, Any] | None = None
         if signal.event_datetime is not None:
             event_datetime = signal.event_datetime
             logger.info(
@@ -447,13 +491,79 @@ class DiscordSignalClient(discord.Client):
                 message_id,
                 event_datetime,
             )
+            if self._sports_event_settings is not None and self._sports_event_settings.enabled:
+                explicit_utc = _datetime_as_utc(
+                    signal.event_datetime,
+                    self._base_settings.timezone,
+                )
+                sports_event_audit = _explicit_datetime_audit(
+                    source_bet_id=source_bet_id,
+                    mode=self._sports_event_settings.mode,
+                    sport=signal.sport,
+                    event_name=signal.event,
+                    explicit_datetime_utc=explicit_utc,
+                )
         else:
-            event_datetime = _message_datetime(message.created_at)
+            event_datetime = fallback_datetime_utc
             logger.info(
                 "Discord usou data/hora de envio da mensagem: message_id=%s event_datetime=%s",
                 message_id,
                 event_datetime,
             )
+            if self._sports_event_service is not None and self._sports_event_settings is not None:
+                try:
+                    sports_result = await asyncio.to_thread(
+                        self._sports_event_service.resolve_event,
+                        sport=signal.sport,
+                        event_name=signal.event,
+                        received_at_utc=fallback_datetime_utc,
+                    )
+                    sports_event_audit = sports_result.as_audit_dict(
+                        source_bet_id=source_bet_id,
+                        mode=self._sports_event_settings.mode,
+                        fallback_datetime_utc=fallback_datetime_utc,
+                    )
+                    if not self._sports_event_settings.store_raw_payload:
+                        sports_event_audit["raw_payload"] = {}
+                    if (
+                        self._sports_event_settings.mode == "enabled"
+                        and sports_result.accepted
+                        and sports_result.event is not None
+                    ):
+                        event_datetime = sports_result.event.starts_at_utc
+                        logger.info(
+                            "Discord usou horario oficial do evento: message_id=%s provider=%s external_event_id=%s event_datetime_utc=%s confidence=%.4f",
+                            message_id,
+                            sports_result.event.provider,
+                            sports_result.event.external_event_id,
+                            event_datetime.isoformat(),
+                            sports_result.confidence,
+                        )
+                    elif self._sports_event_settings.mode == "shadow":
+                        logger.info(
+                            "Sports shadow preservou horario da mensagem: message_id=%s candidato=%s confidence=%.4f reason=%s",
+                            message_id,
+                            (
+                                sports_result.event.starts_at_utc.isoformat()
+                                if sports_result.event is not None
+                                else None
+                            ),
+                            sports_result.confidence,
+                            sports_result.reason,
+                        )
+                except Exception as exc:
+                    logger.exception(
+                        "Identificacao esportiva falhou; horario da mensagem sera preservado. message_id=%s",
+                        message_id,
+                    )
+                    sports_event_audit = _sports_fallback_audit(
+                        source_bet_id=source_bet_id,
+                        mode=self._sports_event_settings.mode,
+                        sport=signal.sport,
+                        event_name=signal.event,
+                        fallback_datetime_utc=fallback_datetime_utc,
+                        reason=f"unexpected_error:{type(exc).__name__}",
+                    )
         tip = ParsedTelegramTip(
             tipster=self._settings.destination_tipster_name,
             event_datetime=event_datetime,
@@ -483,6 +593,14 @@ class DiscordSignalClient(discord.Client):
         if not inserted:
             logger.info("Sinal Discord duplicado ignorado apos enqueue: source_bet_id=%s", source_bet_id)
             return
+        if sports_event_audit is not None:
+            try:
+                self._store.record_sports_event_match(sports_event_audit)
+            except Exception:
+                logger.exception(
+                    "Falha ao persistir auditoria esportiva; aposta continuara normalmente. source_bet_id=%s",
+                    source_bet_id,
+                )
 
         reaction_label = "coracao" if is_accumulator else "thumbs-up"
         logger.info(
@@ -711,6 +829,136 @@ class DiscordSignalClient(discord.Client):
             interval = self._peixeesperto_settings.sync_interval_seconds if self._peixeesperto_settings else 300
             await asyncio.sleep(max(60, interval))
 
+    async def _sports_event_recheck_scheduler(self) -> None:
+        """Reconsulta eventos vinculados e atualiza somente mudanças seguras."""
+
+        if self._sports_event_service is None or self._sports_event_settings is None:
+            return
+        await self.wait_until_ready()
+
+        while not self.is_closed():
+            try:
+                rows = self._store.get_due_sports_event_matches(limit=50)
+                for row in rows:
+                    await self._refresh_sports_event_match(row)
+                if rows:
+                    logger.info(
+                        "Sports event recheck processou %s vinculos; metrics=%s",
+                        len(rows),
+                        json.dumps(
+                            self._sports_event_service.metrics_snapshot(),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                    )
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception(
+                    "Falha no scheduler de reconsulta esportiva; fluxo principal permanece ativo."
+                )
+            await asyncio.sleep(
+                max(
+                    60,
+                    self._sports_event_settings.recheck_scheduler_interval_seconds,
+                )
+            )
+
+    async def _refresh_sports_event_match(self, row: sqlite3.Row) -> None:
+        if self._sports_event_service is None or self._sports_event_settings is None:
+            return
+        source_bet_id = int(row["source_bet_id"])
+        provider = str(row["provider"])
+        external_event_id = str(row["external_event_id"])
+        try:
+            payload = json.loads(str(row["payload_json"]))
+            tip = tip_from_payload(payload)
+            event = await asyncio.to_thread(
+                self._sports_event_service.refresh_event,
+                provider_name=provider,
+                external_event_id=external_event_id,
+            )
+            if event is None:
+                raise RuntimeError("provider_nao_retornou_evento")
+
+            next_check = self._sports_event_service.next_recheck_timestamp(
+                event.starts_at_utc,
+                event.status,
+            )
+            previous = datetime.fromisoformat(str(row["starts_at_utc"]))
+            applied_value = row["applied_starts_at_utc"] or row["starts_at_utc"]
+            applied_datetime = datetime.fromisoformat(str(applied_value))
+            changed = abs(
+                (
+                    event.starts_at_utc
+                    - _datetime_as_utc(applied_datetime, "UTC")
+                ).total_seconds()
+            ) >= 60
+            blocked_status = str(event.status or "").casefold() in {
+                "cancelled",
+                "canceled",
+                "canc",
+                "postponed",
+                "pst",
+                "suspended",
+                "susp",
+                "abandoned",
+                "abd",
+                "finished",
+                "ft",
+                "completed",
+            }
+            action = "checked_no_change"
+            if changed and not blocked_status and not tip.is_accumulator:
+                await asyncio.to_thread(
+                    self._writer.update_bet_datetime,
+                    int(row["bet_analytix_bet_id"]),
+                    event.starts_at_utc,
+                )
+                action = "bet_datetime_updated"
+                logger.info(
+                    "Sports event reagendado no Bet-Analytix: source_bet_id=%s provider=%s external_event_id=%s old=%s new=%s",
+                    source_bet_id,
+                    provider,
+                    external_event_id,
+                    previous.isoformat(),
+                    event.starts_at_utc.isoformat(),
+                )
+            elif changed and tip.is_accumulator:
+                action = "accumulator_change_not_applied"
+            elif blocked_status:
+                action = "status_change_not_applied"
+
+            self._store.record_sports_event_refresh(
+                source_bet_id=source_bet_id,
+                starts_at_utc=event.starts_at_utc.isoformat(),
+                event_status=event.status,
+                next_check_at_ts=next_check,
+                action=action,
+                applied_datetime_updated=action == "bet_datetime_updated",
+                details={
+                    "changed": changed,
+                    "blocked_status": blocked_status,
+                    "is_accumulator": tip.is_accumulator,
+                },
+            )
+        except Exception as exc:
+            retry_at = int(time.time()) + max(
+                300,
+                self._sports_event_settings.recheck_within_24h_seconds,
+            )
+            self._store.record_sports_event_refresh_error(
+                source_bet_id,
+                f"{type(exc).__name__}: {exc}",
+                retry_at,
+            )
+            logger.warning(
+                "Sports event recheck adiado: source_bet_id=%s provider=%s error_type=%s",
+                source_bet_id,
+                provider,
+                type(exc).__name__,
+            )
+
     async def _alert_async(self, title: str, details: str | None, dedupe_key: str) -> None:
         if self._alerter is not None:
             await asyncio.to_thread(self._alerter.send, title, details, dedupe_key)
@@ -735,6 +983,7 @@ async def main_async(env_path: str | Path = ".env") -> None:
     discord_settings = load_discord_reaction_settings(env_path)
     bankroll_settings = load_bankroll_settings(env_path)
     peixeesperto_settings = load_peixeesperto_settings(env_path)
+    sports_event_settings = load_sports_event_settings(env_path)
     configure_logging(discord_settings.log_level)
     validate_discord_reaction_settings(discord_settings)
 
@@ -763,6 +1012,20 @@ async def main_async(env_path: str | Path = ".env") -> None:
         if peixeesperto_settings.enabled
         else None
     )
+    sports_event_service: SportsEventService | None = None
+    if sports_event_settings.enabled:
+        sports_store = SportsScheduleStore(sports_event_settings.cache_path)
+        sports_store.initialize()
+        sports_event_service = SportsEventService(
+            settings=sports_event_settings,
+            store=sports_store,
+        )
+        logger.info(
+            "Identificacao esportiva inicializada: mode=%s cache=%s providers=%s",
+            sports_event_settings.mode,
+            sports_event_settings.cache_path,
+            ",".join(sports_event_service.available_providers) or "nenhum",
+        )
 
     bankroll_controller: BankrollController | None = None
     if bankroll_settings.enabled:
@@ -796,6 +1059,8 @@ async def main_async(env_path: str | Path = ".env") -> None:
         bankroll_controller=bankroll_controller,
         peixeesperto_settings=peixeesperto_settings,
         peixeesperto_sync=peixeesperto_sync,
+        sports_event_settings=sports_event_settings,
+        sports_event_service=sports_event_service,
     )
     token = discord_settings.user_token or discord_settings.bot_token
     await client.start(str(token))
@@ -871,6 +1136,97 @@ def _message_datetime(value: datetime | None) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _datetime_as_utc(value: datetime, local_timezone_name: str) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=ZoneInfo(local_timezone_name)).astimezone(timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _explicit_datetime_audit(
+    *,
+    source_bet_id: int,
+    mode: str,
+    sport: str,
+    event_name: str,
+    explicit_datetime_utc: datetime,
+) -> dict[str, Any]:
+    return {
+        "source_bet_id": source_bet_id,
+        "mode": mode,
+        "match_status": "explicit_datetime",
+        "match_reason": "signal_provided_event_datetime_preserved",
+        "sport": sport,
+        "signal_participants": _audit_participants(event_name),
+        "normalized_signal_participants": None,
+        "provider": None,
+        "external_event_id": None,
+        "participant_home": None,
+        "participant_away": None,
+        "normalized_event_participants": None,
+        "competition": None,
+        "country": None,
+        "starts_at_utc": explicit_datetime_utc.isoformat(),
+        "event_status": None,
+        "confidence": 1.0,
+        "participant_1_score": 1.0,
+        "participant_2_score": 1.0,
+        "second_best_confidence": None,
+        "candidate_count": 0,
+        "providers_consulted": [],
+        "reasons": ["explicit_signal_datetime"],
+        "from_cache": False,
+        "fallback_datetime_utc": explicit_datetime_utc.isoformat(),
+        "raw_payload": {},
+    }
+
+
+def _sports_fallback_audit(
+    *,
+    source_bet_id: int,
+    mode: str,
+    sport: str,
+    event_name: str,
+    fallback_datetime_utc: datetime,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "source_bet_id": source_bet_id,
+        "mode": mode,
+        "match_status": "fallback",
+        "match_reason": reason,
+        "sport": sport,
+        "signal_participants": _audit_participants(event_name),
+        "normalized_signal_participants": None,
+        "provider": None,
+        "external_event_id": None,
+        "participant_home": None,
+        "participant_away": None,
+        "normalized_event_participants": None,
+        "competition": None,
+        "country": None,
+        "starts_at_utc": None,
+        "event_status": None,
+        "confidence": 0.0,
+        "participant_1_score": 0.0,
+        "participant_2_score": 0.0,
+        "second_best_confidence": None,
+        "candidate_count": 0,
+        "providers_consulted": [],
+        "reasons": [reason],
+        "from_cache": False,
+        "fallback_datetime_utc": fallback_datetime_utc.isoformat(),
+        "raw_payload": {},
+    }
+
+
+def _audit_participants(event_name: str) -> list[str] | None:
+    for marker in (" x ", " X ", " vs ", " VS "):
+        parts = event_name.split(marker, 1)
+        if len(parts) == 2 and all(part.strip() for part in parts):
+            return [parts[0].strip(), parts[1].strip()]
+    return None
 
 
 def _extract_created_bet_id(response: list[dict[str, Any]]) -> int | None:

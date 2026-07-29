@@ -43,6 +43,25 @@ O runner também separa automaticamente os bancos SQLite:
 6. O `railway.json` já define o start command como `python run_railway.py`.
 7. Deploy.
 
+## Agenda esportiva compartilhada
+
+As instancias Discord podem compartilhar o cache de eventos:
+
+```env
+SPORTS_EVENT_MATCHING_MODE=shadow
+SPORTS_EVENT_CACHE_PATH=data/sports_schedule.sqlite3
+```
+
+Mantenha essas variaveis sem prefixo (`MATHEUS_`, `RENAN_`, etc.) quando todas
+as instancias rodam no mesmo container. Assim, os subprocessos usam o mesmo
+SQLite/WAL, lock e controle de cotas; uma consulta feita por uma instancia
+atende as demais. O arquivo precisa ficar no volume persistente montado em
+`/app/data`.
+
+Comece em `shadow`, valide os logs `sports_event_match` e a tabela
+`sports_event_matches` de cada banco Discord. Depois troque para `enabled`.
+O guia completo esta em `SPORTS_EVENT_MATCHING.md`.
+
 ## Userbot
 
 O userbot precisa de uma sessão MTProto (`*.session`). Gere localmente:

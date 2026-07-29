@@ -214,6 +214,76 @@ class DiscordSignalStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sports_event_matches (
+                    source_bet_id INTEGER PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    match_status TEXT NOT NULL,
+                    match_reason TEXT NOT NULL,
+                    sport TEXT,
+                    signal_participants_json TEXT,
+                    normalized_signal_participants_json TEXT,
+                    provider TEXT,
+                    external_event_id TEXT,
+                    participant_home TEXT,
+                    participant_away TEXT,
+                    normalized_event_participants_json TEXT,
+                    competition TEXT,
+                    country TEXT,
+                    starts_at_utc TEXT,
+                    event_status TEXT,
+                    confidence REAL,
+                    participant_1_score REAL,
+                    participant_2_score REAL,
+                    second_best_confidence REAL,
+                    candidate_count INTEGER NOT NULL DEFAULT 0,
+                    providers_consulted_json TEXT,
+                    reasons_json TEXT,
+                    from_cache INTEGER NOT NULL DEFAULT 0,
+                    fallback_datetime_utc TEXT NOT NULL,
+                    raw_payload_json TEXT,
+                    matched_at_ts INTEGER NOT NULL,
+                    last_checked_at_ts INTEGER,
+                    next_check_at_ts INTEGER,
+                    applied_to_bet INTEGER NOT NULL DEFAULT 0,
+                    applied_starts_at_utc TEXT,
+                    bet_analytix_bet_id INTEGER,
+                    last_refresh_error TEXT
+                )
+                """
+            )
+            try:
+                connection.execute(
+                    "ALTER TABLE sports_event_matches ADD COLUMN applied_starts_at_utc TEXT"
+                )
+            except sqlite3.OperationalError:
+                pass
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_sports_event_matches_recheck
+                ON sports_event_matches (
+                    mode, match_status, applied_to_bet, next_check_at_ts
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sports_event_match_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_bet_id INTEGER NOT NULL,
+                    provider TEXT,
+                    external_event_id TEXT,
+                    previous_starts_at_utc TEXT,
+                    new_starts_at_utc TEXT,
+                    previous_status TEXT,
+                    new_status TEXT,
+                    action TEXT NOT NULL,
+                    details_json TEXT,
+                    created_at_ts INTEGER NOT NULL
+                )
+                """
+            )
 
     def enqueue_signal(
         self,
@@ -454,6 +524,227 @@ class DiscordSignalStore:
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (message_id, estado, bet_analytix_bet_id, matched_source_bet_id, int(time.time())),
+            )
+
+    def record_sports_event_match(self, audit: dict[str, Any]) -> None:
+        """Persiste o resultado aceito, shadow ou fallback de forma auditável."""
+
+        now = int(time.time())
+        starts_at = audit.get("starts_at_utc")
+        next_check = now + 1800 if audit.get("match_status") == "accepted" else None
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO sports_event_matches (
+                    source_bet_id, mode, match_status, match_reason, sport,
+                    signal_participants_json, normalized_signal_participants_json,
+                    provider, external_event_id, participant_home, participant_away,
+                    normalized_event_participants_json, competition, country,
+                    starts_at_utc, event_status, confidence,
+                    participant_1_score, participant_2_score,
+                    second_best_confidence, candidate_count,
+                    providers_consulted_json, reasons_json, from_cache,
+                    fallback_datetime_utc, raw_payload_json,
+                    matched_at_ts, last_checked_at_ts, next_check_at_ts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_bet_id) DO UPDATE SET
+                    mode = excluded.mode,
+                    match_status = excluded.match_status,
+                    match_reason = excluded.match_reason,
+                    sport = excluded.sport,
+                    signal_participants_json = excluded.signal_participants_json,
+                    normalized_signal_participants_json = excluded.normalized_signal_participants_json,
+                    provider = excluded.provider,
+                    external_event_id = excluded.external_event_id,
+                    participant_home = excluded.participant_home,
+                    participant_away = excluded.participant_away,
+                    normalized_event_participants_json = excluded.normalized_event_participants_json,
+                    competition = excluded.competition,
+                    country = excluded.country,
+                    starts_at_utc = excluded.starts_at_utc,
+                    event_status = excluded.event_status,
+                    confidence = excluded.confidence,
+                    participant_1_score = excluded.participant_1_score,
+                    participant_2_score = excluded.participant_2_score,
+                    second_best_confidence = excluded.second_best_confidence,
+                    candidate_count = excluded.candidate_count,
+                    providers_consulted_json = excluded.providers_consulted_json,
+                    reasons_json = excluded.reasons_json,
+                    from_cache = excluded.from_cache,
+                    fallback_datetime_utc = excluded.fallback_datetime_utc,
+                    raw_payload_json = excluded.raw_payload_json,
+                    matched_at_ts = excluded.matched_at_ts,
+                    last_checked_at_ts = excluded.last_checked_at_ts,
+                    next_check_at_ts = excluded.next_check_at_ts,
+                    last_refresh_error = NULL
+                """,
+                (
+                    int(audit["source_bet_id"]),
+                    str(audit["mode"]),
+                    str(audit["match_status"]),
+                    str(audit["match_reason"]),
+                    audit.get("sport"),
+                    _json_or_none(audit.get("signal_participants")),
+                    _json_or_none(audit.get("normalized_signal_participants")),
+                    audit.get("provider"),
+                    audit.get("external_event_id"),
+                    audit.get("participant_home"),
+                    audit.get("participant_away"),
+                    _json_or_none(audit.get("normalized_event_participants")),
+                    audit.get("competition"),
+                    audit.get("country"),
+                    starts_at,
+                    audit.get("event_status"),
+                    audit.get("confidence"),
+                    audit.get("participant_1_score"),
+                    audit.get("participant_2_score"),
+                    audit.get("second_best_confidence"),
+                    int(audit.get("candidate_count") or 0),
+                    _json_or_none(audit.get("providers_consulted")),
+                    _json_or_none(audit.get("reasons")),
+                    1 if audit.get("from_cache") else 0,
+                    str(audit["fallback_datetime_utc"]),
+                    _json_or_none(audit.get("raw_payload")),
+                    now,
+                    now if starts_at else None,
+                    next_check,
+                ),
+            )
+
+    def mark_sports_event_applied(
+        self,
+        source_bet_id: int,
+        bet_analytix_bet_id: int | None,
+        next_check_at_ts: int | None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE sports_event_matches
+                SET applied_to_bet = 1,
+                    applied_starts_at_utc = starts_at_utc,
+                    bet_analytix_bet_id = ?,
+                    next_check_at_ts = ?,
+                    last_refresh_error = NULL
+                WHERE source_bet_id = ?
+                  AND mode = 'enabled'
+                  AND match_status = 'accepted'
+                """,
+                (bet_analytix_bet_id, next_check_at_ts, source_bet_id),
+            )
+
+    def get_due_sports_event_matches(self, limit: int = 50) -> list[sqlite3.Row]:
+        now = int(time.time())
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT m.*, j.payload_json
+                FROM sports_event_matches m
+                JOIN discord_signal_jobs j ON j.source_bet_id = m.source_bet_id
+                WHERE m.mode = 'enabled'
+                  AND m.match_status = 'accepted'
+                  AND m.applied_to_bet = 1
+                  AND m.bet_analytix_bet_id IS NOT NULL
+                  AND m.provider IS NOT NULL
+                  AND m.external_event_id IS NOT NULL
+                  AND m.next_check_at_ts IS NOT NULL
+                  AND m.next_check_at_ts <= ?
+                ORDER BY m.next_check_at_ts ASC
+                LIMIT ?
+                """,
+                (now, limit),
+            ).fetchall()
+        return list(rows)
+
+    def record_sports_event_refresh(
+        self,
+        *,
+        source_bet_id: int,
+        starts_at_utc: str,
+        event_status: str | None,
+        next_check_at_ts: int | None,
+        action: str,
+        applied_datetime_updated: bool = False,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        now = int(time.time())
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = connection.execute(
+                """
+                SELECT provider, external_event_id, starts_at_utc, event_status
+                FROM sports_event_matches WHERE source_bet_id = ?
+                """,
+                (source_bet_id,),
+            ).fetchone()
+            if previous is None:
+                return
+            if (
+                previous["starts_at_utc"] != starts_at_utc
+                or previous["event_status"] != event_status
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO sports_event_match_history (
+                        source_bet_id, provider, external_event_id,
+                        previous_starts_at_utc, new_starts_at_utc,
+                        previous_status, new_status, action, details_json, created_at_ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        source_bet_id,
+                        previous["provider"],
+                        previous["external_event_id"],
+                        previous["starts_at_utc"],
+                        starts_at_utc,
+                        previous["event_status"],
+                        event_status,
+                        action,
+                        _json_or_none(details),
+                        now,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE sports_event_matches
+                SET starts_at_utc = ?,
+                    applied_starts_at_utc = CASE
+                        WHEN ? = 1 THEN ?
+                        ELSE applied_starts_at_utc
+                    END,
+                    event_status = ?,
+                    last_checked_at_ts = ?,
+                    next_check_at_ts = ?,
+                    last_refresh_error = NULL
+                WHERE source_bet_id = ?
+                """,
+                (
+                    starts_at_utc,
+                    1 if applied_datetime_updated else 0,
+                    starts_at_utc,
+                    event_status,
+                    now,
+                    next_check_at_ts,
+                    source_bet_id,
+                ),
+            )
+
+    def record_sports_event_refresh_error(
+        self,
+        source_bet_id: int,
+        error: str,
+        next_check_at_ts: int,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE sports_event_matches
+                SET last_checked_at_ts = ?,
+                    next_check_at_ts = ?,
+                    last_refresh_error = ?
+                WHERE source_bet_id = ?
+                """,
+                (int(time.time()), next_check_at_ts, error[:1000], source_bet_id),
             )
 
     def update_job_bookmaker(self, job_id: int, new_bookmaker: str) -> bool:
@@ -953,3 +1244,9 @@ def tip_from_payload(payload: dict[str, Any]) -> ParsedTelegramTip:
         extra_note=str(payload["extra_note"]) if payload.get("extra_note") is not None else None,
         is_accumulator=bool(payload.get("is_accumulator", False)),
     )
+
+
+def _json_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
