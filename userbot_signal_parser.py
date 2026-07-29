@@ -73,7 +73,10 @@ PATTERNS: dict[str, re.Pattern[str]] = {
 SIGNAL_MARKER_PATTERN = re.compile(r"Jogue\s+com\s+responsabilidade", re.IGNORECASE)
 ODD_CHANGED_MARKER_PATTERN = re.compile(r"Odd\s+mudou\?\s+\[?Clique\s+AQUI\]?", re.IGNORECASE)
 FAIR_ODD_PATTERN = re.compile(r"Odd\s+justa\s*:\s*(?P<value>\d+(?:[.,]\d+)?)", re.IGNORECASE)
-OVERLOAD_TITLE_PATTERN = re.compile(r"^\s*SOBRECARGA\s*$", re.IGNORECASE)
+OVERLOAD_TITLE_PATTERN = re.compile(
+    r"^\s*(?:SOBRECARGA|\*\*SOBRECARGA\*\*|__SOBRECARGA__)\s*$",
+    re.IGNORECASE,
+)
 OVERLOAD_FIELD_LINES: dict[str, int] = {
     "bookmaker": 1,
     "event": 2,

@@ -112,6 +112,27 @@ class SignalLayoutTests(unittest.TestCase):
         self.assertEqual(signal.source_bookmaker, "Donald Bet")
         self.assertEqual(signal.admin, "victylty")
 
+    def test_overload_accepts_discord_bold_markdown_title(self) -> None:
+        text = (
+            OVERLOAD_SIGNAL
+            .replace("SOBRECARGA", "**SOBRECARGA**", 1)
+            .replace(
+                "📊 Odd mudou? Clique AQUI e calcule quanto vale.",
+                "📊 Odd mudou? [Clique AQUI](https://calc.peixeesperto.com.br/?justa=2.930) "
+                "e calcule quanto vale.",
+            )
+        )
+
+        self.assertTrue(
+            is_external_signal_message(
+                text,
+                signal_marker_pattern=ODD_CHANGED_MARKER_PATTERN,
+            )
+        )
+        signal = self._parse(text)
+        self.assertEqual(signal.source_bookmaker, "Donald Bet")
+        self.assertEqual(signal.fair_odd, "2.930")
+
     def test_both_layouts_are_recognized_before_reaction_processing(self) -> None:
         for text in (MANAGEMENT_SIGNAL, OVERLOAD_SIGNAL):
             with self.subTest(first_line=text.splitlines()[0]):
