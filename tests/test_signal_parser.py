@@ -57,6 +57,76 @@ Não tem cadastro? Faça clicando AQUI... Nos ajuda MUITO e você não perde nad
 
 🦈 PLANILHAR COM SHARK TRACK"""
 
+OVERLOAD_SIGNAL_WITH_ATTRIBUTION = """SOBRECARGA
+
+Pitaco
+Internacional x Flamengo
+Futebol
+Pedro 1+ - Finalizações no gol / Flamengo mais de 2.5 - Defesas de goleiro / Mais de 1.5 - Total de
+3.47
+Limite da aposta: R$999,00
+0,86%
+R$86,00
+Não
+@galomatouoduarte
+ADM: victylty
+
+https://pitaco.bet.br/betting/events/13331880643
+
+n tenho conta, ve limite pfv
+
+Odd justa: 3.198
+
+📊 Odd mudou? [Clique AQUI](https://calc.peixeesperto.com.br/?justa=3.198) e calcule quanto vale.
+
+🦈 [PLANILHAR COM SHARK TRACK](https://t.me/SharkTrackAPP_bot?start=tip_019fafa0-e855-727a-b792-90d35767c989)"""
+
+OVERLOAD_ICE_BET_SIGNAL = """SOBRECARGA
+
+ICE BET
+Tigre x Nacional Montevideo
+Futebol
+Tigre - Resultado final / Mais de 2.5 - Total de gols / Sim - Ambas marcam
+6.20
+Limite da aposta: R$50,00
+0,39%
+R$39,00
+Não
+
+ADM: paterra
+
+https://ice.bet.br/sports/1/821352502514806784/867599274622586880
+
+Odd justa: 5.735
+
+📊 Odd mudou? [Clique AQUI](https://calc.peixeesperto.com.br/?justa=5.735) e calcule quanto vale.
+
+🦈 [PLANILHAR COM SHARK TRACK](https://t.me/SharkTrackAPP_bot?start=tip_019faab8-696e-7063-86bd-8a75b1d3eb34)"""
+
+OVERLOAD_LOTTU_SIGNAL = """SOBRECARGA
+
+Lottu
+Fluminense x Bahia
+Futebol
+Fluminense - Resultado final / Hulk - Para marcar a qualquer momento
+4.60
+Limite da aposta: R$100,00
+0,48%
+R$48,00
+Não
+
+ADM: victylty
+
+https://www.lottu.bet.br/bet/share/6501701
+
+Essa eh sobrecarga no Hulk e no Flu, cuidado
+
+Odd justa: 4.303
+
+📊 Odd mudou? [Clique AQUI](https://calc.peixeesperto.com.br/?justa=4.303) e calcule quanto vale.
+
+🦈 [PLANILHAR COM SHARK TRACK](https://t.me/SharkTrackAPP_bot?start=tip_019faa63-6669-73da-85e3-009d164b26d1)"""
+
 
 class SignalLayoutTests(unittest.TestCase):
     def _parse(self, text: str):
@@ -98,6 +168,110 @@ class SignalLayoutTests(unittest.TestCase):
         self.assertEqual(signal.admin, "victylty")
         self.assertEqual(signal.fair_odd, "2.930")
         self.assertEqual(signal.note("channel", 1), "Odd justa: 2.930")
+
+    def test_overload_variants_map_all_fields(self) -> None:
+        cases = (
+            (
+                OVERLOAD_SIGNAL_WITH_ATTRIBUTION,
+                {
+                    "bookmaker": "Pitaco",
+                    "event": "Internacional x Flamengo",
+                    "pick": (
+                        "Pedro 1+ - Finalizações no gol / Flamengo mais de 2.5 - "
+                        "Defesas de goleiro / Mais de 1.5 - Total de"
+                    ),
+                    "odd": 3.47,
+                    "limit": "R$999,00",
+                    "edge": "0,86%",
+                    "stake": 86.0,
+                    "admin": "victylty",
+                    "fair_odd": "3.198",
+                },
+            ),
+            (
+                OVERLOAD_SIGNAL,
+                {
+                    "bookmaker": "Donald Bet",
+                    "event": "Corinthians x Athletico Paranaense",
+                    "pick": "Corinthians - Resultado do 1º tempo",
+                    "odd": 3.02,
+                    "limit": "R$25,00",
+                    "edge": "0,38%",
+                    "stake": 25.0,
+                    "admin": "victylty",
+                    "fair_odd": "2.930",
+                },
+            ),
+            (
+                OVERLOAD_ICE_BET_SIGNAL,
+                {
+                    "bookmaker": "ICE BET",
+                    "event": "Tigre x Nacional Montevideo",
+                    "pick": (
+                        "Tigre - Resultado final / Mais de 2.5 - Total de gols / "
+                        "Sim - Ambas marcam"
+                    ),
+                    "odd": 6.20,
+                    "limit": "R$50,00",
+                    "edge": "0,39%",
+                    "stake": 39.0,
+                    "admin": "paterra",
+                    "fair_odd": "5.735",
+                },
+            ),
+            (
+                OVERLOAD_LOTTU_SIGNAL,
+                {
+                    "bookmaker": "Lottu",
+                    "event": "Fluminense x Bahia",
+                    "pick": "Fluminense - Resultado final / Hulk - Para marcar a qualquer momento",
+                    "odd": 4.60,
+                    "limit": "R$100,00",
+                    "edge": "0,48%",
+                    "stake": 48.0,
+                    "admin": "victylty",
+                    "fair_odd": "4.303",
+                },
+            ),
+        )
+
+        for text, expected in cases:
+            with self.subTest(bookmaker=expected["bookmaker"]):
+                self.assertTrue(
+                    is_external_signal_message(
+                        text,
+                        signal_marker_pattern=ODD_CHANGED_MARKER_PATTERN,
+                    )
+                )
+                signal = self._parse(text)
+                self.assertEqual(signal.sport, "Futebol")
+                self.assertEqual(signal.freebet, "Não")
+                for field, value in expected.items():
+                    self.assertEqual(getattr(signal, field), value)
+
+    def test_overload_accepts_sim_as_freebet(self) -> None:
+        signal = self._parse(OVERLOAD_SIGNAL.replace("\nNão\n", "\nSim\n", 1))
+
+        self.assertEqual(signal.freebet, "Sim")
+
+    def test_overload_accepts_discord_user_mention_before_admin(self) -> None:
+        text = OVERLOAD_SIGNAL.replace("\nADM:", "\n<@!123456789>\nADM:", 1)
+
+        signal = self._parse(text)
+
+        self.assertEqual(signal.admin, "victylty")
+
+    def test_overload_rejects_arbitrary_text_before_admin(self) -> None:
+        text = OVERLOAD_SIGNAL.replace("\nADM:", "\ncomentario solto\nADM:", 1)
+
+        self.assertFalse(
+            is_external_signal_message(
+                text,
+                signal_marker_pattern=ODD_CHANGED_MARKER_PATTERN,
+            )
+        )
+        with self.assertRaises(UserbotSignalParseError):
+            self._parse(text)
 
     def test_overload_title_and_labels_are_case_insensitive(self) -> None:
         text = (

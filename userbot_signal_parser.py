@@ -87,8 +87,8 @@ OVERLOAD_FIELD_LINES: dict[str, int] = {
     "edge": 7,
     "stake": 8,
     "freebet": 9,
-    "admin": 10,
 }
+OVERLOAD_ADMIN_START_LINE = 10
 OVERLOAD_FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
     "odd": re.compile(r"^\s*(?P<value>\d+(?:[.,]\d+)?)\s*$"),
     "limit": re.compile(
@@ -97,8 +97,13 @@ OVERLOAD_FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
     ),
     "edge": re.compile(r"^\s*(?P<value>[\d.,]+\s*%)\s*$"),
     "stake": re.compile(r"^\s*(?P<value>R\$\s*[\d.,]+|[\d.,]+)\s*$", re.IGNORECASE),
+    "freebet": re.compile(r"^\s*(?P<value>Sim|N[aã]o)\s*$", re.IGNORECASE),
     "admin": re.compile(r"^\s*ADM\s*:\s*(?P<value>[^\n\r]+?)\s*$", re.IGNORECASE),
 }
+OVERLOAD_ATTRIBUTION_PATTERN = re.compile(
+    r"^\s*(?:@\S+|<@!?\d+>)\s*$",
+    re.IGNORECASE,
+)
 
 
 def parse_external_signal(
@@ -310,13 +315,30 @@ def _validate_overload_header_layout(header: str) -> None:
                 f"Cabecalho SOBRECARGA fora do padrao na linha {line_index + 1}: {field}"
             )
 
+    admin_index = _overload_admin_line_index(lines)
+    if admin_index is None:
+        raise UserbotSignalParseError("Cabecalho SOBRECARGA fora do padrao: admin")
+
+    for line_index in range(OVERLOAD_ADMIN_START_LINE, admin_index):
+        if not OVERLOAD_ATTRIBUTION_PATTERN.fullmatch(lines[line_index]):
+            raise UserbotSignalParseError(
+                "Cabecalho SOBRECARGA contem metadado invalido "
+                f"antes do ADM na linha {line_index + 1}"
+            )
+
 
 def _optional_overload_field(text: str, field: str) -> str | None:
-    line_index = OVERLOAD_FIELD_LINES.get(field)
+    lines = text.splitlines()
+    if field == "admin":
+        line_index = _overload_admin_line_index(lines)
+        if line_index is None:
+            return None
+    else:
+        line_index = OVERLOAD_FIELD_LINES.get(field)
+
     if line_index is None:
         return None
 
-    lines = text.splitlines()
     if line_index >= len(lines):
         return None
 
@@ -337,6 +359,14 @@ def _optional_overload_field(text: str, field: str) -> str | None:
     if field in {"bookmaker", "event", "pick", "freebet"}:
         return value if _looks_like_overload_value(value) else None
     return value
+
+
+def _overload_admin_line_index(lines: list[str]) -> int | None:
+    pattern = OVERLOAD_FIELD_PATTERNS["admin"]
+    for line_index in range(OVERLOAD_ADMIN_START_LINE, len(lines)):
+        if pattern.fullmatch(lines[line_index]):
+            return line_index
+    return None
 
 
 def _looks_like_overload_value(value: str) -> bool:
