@@ -46,10 +46,12 @@ class FakeProvider:
         self.events = events or []
         self.error = error
         self.search_calls = 0
+        self.search_arguments: list[dict[str, object]] = []
         self.get_calls = 0
 
     def search_events(self, **kwargs):
         self.search_calls += 1
+        self.search_arguments.append(dict(kwargs))
         if self.error:
             raise self.error
         return list(self.events)
@@ -81,6 +83,75 @@ def fixture(provider: str = "football_data") -> ExternalSportsEvent:
 
 
 class SportsEventServiceTests(unittest.TestCase):
+    def test_composite_event_uses_first_complete_leg_as_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = settings_for(Path(temp_dir) / "sports.sqlite3")
+            store = SportsScheduleStore(settings.cache_path)
+            store.initialize()
+            provider = FakeProvider("football_data", [fixture()])
+            service = SportsEventService(
+                settings,
+                store,
+                {"football_data": provider},
+            )
+
+            with self.assertLogs("sports_event_service", level="INFO") as logs:
+                result = service.resolve_event(
+                    sport="Futebol",
+                    event_name=(
+                        "Santos x Chapecoense / Internacional x Flamengo / "
+                        "Vitoria x Palmeiras"
+                    ),
+                    received_at_utc=NOW,
+                )
+
+            self.assertTrue(result.accepted)
+            self.assertEqual(result.participants, ("Santos", "Chapecoense"))
+            self.assertIn(
+                "composite_event_first_leg_reference",
+                result.reasons,
+            )
+            self.assertEqual(provider.search_calls, 1)
+            self.assertEqual(
+                provider.search_arguments[0]["participants"],
+                ("Santos", "Chapecoense"),
+            )
+            self.assertIn(
+                '"reference_event_name": "Santos x Chapecoense"',
+                "\n".join(logs.output),
+            )
+            audit = result.as_audit_dict(
+                source_bet_id=1,
+                mode="shadow",
+                fallback_datetime_utc=NOW,
+            )
+            self.assertIn(
+                "composite_event_first_leg_reference",
+                audit["reasons"],
+            )
+
+    def test_malformed_composite_event_keeps_safe_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = settings_for(Path(temp_dir) / "sports.sqlite3")
+            store = SportsScheduleStore(settings.cache_path)
+            store.initialize()
+            provider = FakeProvider("football_data", [fixture()])
+            service = SportsEventService(
+                settings,
+                store,
+                {"football_data": provider},
+            )
+
+            result = service.resolve_event(
+                sport="Futebol",
+                event_name="Santos x Chapecoense / texto incompleto",
+                received_at_utc=NOW,
+            )
+
+            self.assertFalse(result.accepted)
+            self.assertEqual(result.reason, "participants_not_safely_parsed")
+            self.assertEqual(provider.search_calls, 0)
+
     def test_timeout_in_primary_uses_fallback_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = settings_for(Path(temp_dir) / "sports.sqlite3")

@@ -8,12 +8,14 @@ import logging
 import os
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from sports_event_config import SportsEventSettings
 from sports_event_matching import (
     EventMatcher,
     canonical_sport,
+    split_composite_event_legs,
     split_event_participants,
 )
 from sports_event_models import EventMatchResult, ExternalSportsEvent
@@ -68,16 +70,22 @@ class SportsEventService:
         window_start = received_at - timedelta(hours=self.settings.lookback_hours)
         window_end = received_at + timedelta(days=self.settings.lookahead_days)
         canonical = canonical_sport(sport)
-        participants = split_event_participants(event_name)
+        reference_event_name = event_name
+        composite_legs = split_composite_event_legs(event_name)
+        participants = split_event_participants(reference_event_name)
+        if participants is None and composite_legs is not None:
+            reference_event_name = composite_legs[0]
+            participants = split_event_participants(reference_event_name)
         if canonical is None or participants is None:
             result = self._matcher.match(
                 sport=sport,
-                event_name=event_name,
+                event_name=reference_event_name,
                 window_start_utc=window_start,
                 window_end_utc=window_end,
                 events=[],
             )
-            self._log_result(result, event_name)
+            result = self._with_composite_context(result, composite_legs)
+            self._log_result(result, event_name, reference_event_name)
             return result
 
         provider_order = self.settings.providers_for_sport(canonical)
@@ -90,12 +98,13 @@ class SportsEventService:
         if not available_order:
             result = self._matcher.match(
                 sport=sport,
-                event_name=event_name,
+                event_name=reference_event_name,
                 window_start_utc=window_start,
                 window_end_utc=window_end,
                 events=[],
             )
-            self._log_result(result, event_name)
+            result = self._with_composite_context(result, composite_legs)
+            self._log_result(result, event_name, reference_event_name)
             return result
         cached_events = self._store.list_events(
             sport=canonical,
@@ -105,7 +114,7 @@ class SportsEventService:
         )
         cached_result = self._matcher.match(
             sport=sport,
-            event_name=event_name,
+            event_name=reference_event_name,
             window_start_utc=window_start,
             window_end_utc=window_end,
             events=cached_events,
@@ -113,7 +122,15 @@ class SportsEventService:
             from_cache=True,
         )
         if cached_result.accepted:
-            self._log_result(cached_result, event_name)
+            cached_result = self._with_composite_context(
+                cached_result,
+                composite_legs,
+            )
+            self._log_result(
+                cached_result,
+                event_name,
+                reference_event_name,
+            )
             return cached_result
 
         deadline = time.monotonic() + self.settings.total_timeout_seconds
@@ -153,7 +170,7 @@ class SportsEventService:
             )
             result = self._matcher.match(
                 sport=sport,
-                event_name=event_name,
+                event_name=reference_event_name,
                 window_start_utc=window_start,
                 window_end_utc=window_end,
                 events=accumulated,
@@ -161,7 +178,8 @@ class SportsEventService:
                 from_cache=fresh_query is not None,
             )
             if result.accepted:
-                self._log_result(result, event_name)
+                result = self._with_composite_context(result, composite_legs)
+                self._log_result(result, event_name, reference_event_name)
                 return result
 
         final_events = self._store.list_events(
@@ -172,14 +190,15 @@ class SportsEventService:
         )
         result = self._matcher.match(
             sport=sport,
-            event_name=event_name,
+            event_name=reference_event_name,
             window_start_utc=window_start,
             window_end_utc=window_end,
             events=final_events,
             providers_consulted=tuple(consulted),
             from_cache=False,
         )
-        self._log_result(result, event_name)
+        result = self._with_composite_context(result, composite_legs)
+        self._log_result(result, event_name, reference_event_name)
         return result
 
     def refresh_event(
@@ -398,11 +417,39 @@ class SportsEventService:
         return f"search:{digest}"
 
     @staticmethod
-    def _log_result(result: EventMatchResult, event_name: str) -> None:
+    def _with_composite_context(
+        result: EventMatchResult,
+        composite_legs: tuple[str, ...] | None,
+    ) -> EventMatchResult:
+        if composite_legs is None:
+            return result
+        return replace(
+            result,
+            reasons=tuple(
+                dict.fromkeys(
+                    (
+                        *result.reasons,
+                        "composite_event_first_leg_reference",
+                    )
+                )
+            ),
+        )
+
+    @staticmethod
+    def _log_result(
+        result: EventMatchResult,
+        event_name: str,
+        reference_event_name: str,
+    ) -> None:
         payload = {
             "action": "sports_event_match",
             "sport": result.sport,
             "event_name": event_name,
+            "reference_event_name": (
+                reference_event_name
+                if reference_event_name != event_name
+                else None
+            ),
             "participants": list(result.participants) if result.participants else None,
             "normalized_participants": (
                 list(result.normalized_signal_participants)

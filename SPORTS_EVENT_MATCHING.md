@@ -53,6 +53,27 @@ país, status e payload de auditoria.
 7. Horários materialmente conflitantes entre providers para o mesmo evento
    causam fallback; horários próximos são consolidados.
 
+## Eventos com várias partidas
+
+Quando o campo do evento contém várias partidas separadas por `/`, o serviço
+valida todos os blocos. Cada bloco precisa ser um confronto completo
+`Time A x Time B`.
+
+Se a lista inteira for válida, a primeira partida é usada como referência de
+data/hora. Por exemplo:
+
+```text
+Mirassol x Remo / Internacional x Flamengo / Vitoria x Palmeiras
+```
+
+consulta somente `Mirassol x Remo`. O texto completo da aposta continua
+inalterado no Bet-Analytix. O log inclui `reference_event_name` e a auditoria
+inclui o motivo `composite_event_first_leg_reference`.
+
+Essa escolha é determinística, economiza a cota da API e representa o início da
+primeira seleção listada. Se qualquer bloco for inválido ou a primeira partida
+não tiver um match seguro, o horário da mensagem é preservado.
+
 A normalização ignora maiúsculas/minúsculas, acentos, pontuação e sufixos
 comuns de clubes. Há aliases seguros para variações como `São Paulo FC`,
 `Athletico-PR`, `CAP` e `CR Vasco da Gama`. Tênis entende sobrenome/inicial de
@@ -197,10 +218,10 @@ python -m compileall -q .
 python -m unittest discover -s tests -v
 ```
 
-A suíte cobre normalização, ordem invertida, ambiguidades, homônimos perigosos,
-modalidade/categoria errada, tênis, basquete, conflitos de horário, payloads dos
-providers, 429/timeouts, cache compartilhado, locks, cotas, persistência e
-histórico de reagendamento.
+A suíte cobre normalização, ordem invertida, listas com várias partidas,
+ambiguidades, homônimos perigosos, modalidade/categoria errada, tênis, basquete,
+conflitos de horário, payloads dos providers, 429/timeouts, cache compartilhado,
+locks, cotas, persistência e histórico de reagendamento.
 
 ## Adicionando outro provider
 

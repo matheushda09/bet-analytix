@@ -17,6 +17,7 @@ from sports_event_models import (
 
 
 EVENT_SEPARATOR = re.compile(r"\s+(?:x|vs?\.?|versus|@)\s+", re.IGNORECASE)
+COMPOSITE_EVENT_SEPARATOR = re.compile(r"\s*/\s*")
 NON_ALNUM = re.compile(r"[^a-z0-9]+")
 SPACE = re.compile(r"\s+")
 
@@ -171,10 +172,31 @@ def canonical_sport(value: str) -> str | None:
 
 
 def split_event_participants(event_name: str) -> tuple[str, str] | None:
+    # Uma barra indica potencial evento composto e precisa ser validada pela
+    # rotina própria; nunca deve virar parte do nome de um participante.
+    if "/" in event_name:
+        return None
     parts = [part.strip() for part in EVENT_SEPARATOR.split(event_name.strip())]
     if len(parts) != 2 or not all(parts):
         return None
     return parts[0], parts[1]
+
+
+def split_composite_event_legs(event_name: str) -> tuple[str, ...] | None:
+    """Reconhece uma lista em que todos os blocos são confrontos completos."""
+
+    if "/" not in event_name:
+        return None
+    legs = tuple(
+        part.strip()
+        for part in COMPOSITE_EVENT_SEPARATOR.split(event_name.strip())
+        if part.strip()
+    )
+    if len(legs) < 2:
+        return None
+    if any(split_event_participants(leg) is None for leg in legs):
+        return None
+    return legs
 
 
 class EventMatcher:
