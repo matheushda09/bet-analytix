@@ -411,6 +411,9 @@ class SportsEventService:
             _utc(window_start).date().isoformat(),
             _utc(window_end).date().isoformat(),
         ]
+        cache_version = getattr(provider, "cache_version", None)
+        if cache_version:
+            parts.append(str(cache_version))
         if provider.cache_scope == "participants":
             parts.extend(participants)
         digest = hashlib.sha256("|".join(parts).casefold().encode("utf-8")).hexdigest()

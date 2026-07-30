@@ -186,6 +186,131 @@ class ProviderPayloadParsingTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].participant_home, "Chapecoense")
 
+    def test_thesportsdb_uses_team_schedule_when_name_search_returns_old_match(self) -> None:
+        old_direct = response(
+            200,
+            {
+                "event": [
+                    {
+                        "idEvent": "old-1",
+                        "strSport": "Soccer",
+                        "strHomeTeam": "Fluminense",
+                        "idHomeTeam": "134296",
+                        "strAwayTeam": "Bahia",
+                        "idAwayTeam": "134293",
+                        "strTimestamp": "2026-07-12T19:00:00",
+                    }
+                ]
+            },
+        )
+        old_reverse = response(
+            200,
+            {
+                "event": [
+                    {
+                        "idEvent": "old-2",
+                        "strSport": "Soccer",
+                        "strHomeTeam": "Bahia",
+                        "idHomeTeam": "134293",
+                        "strAwayTeam": "Fluminense",
+                        "idAwayTeam": "134296",
+                        "strTimestamp": "2026-02-05T22:00:00",
+                    }
+                ]
+            },
+        )
+        next_home_event = response(
+            200,
+            {
+                "events": [
+                    {
+                        "idEvent": "2398396",
+                        "strSport": "Soccer",
+                        "strHomeTeam": "Fluminense",
+                        "idHomeTeam": "134296",
+                        "strAwayTeam": "Bahia",
+                        "idAwayTeam": "134293",
+                        "strTimestamp": "2026-07-30T00:30:00",
+                    }
+                ]
+            },
+        )
+        session = ResponseSession([old_direct, old_reverse, next_home_event])
+        provider = TheSportsDbProvider(self.settings, self.store, session=session)
+
+        events = provider.search_events(
+            sport="football",
+            participants=("Fluminense", "Bahia"),
+            start_at_utc=datetime(2026, 7, 28, 22, tzinfo=timezone.utc),
+            end_at_utc=datetime(2026, 8, 5, 22, tzinfo=timezone.utc),
+            deadline=9999999999.0,
+        )
+
+        self.assertEqual(session.calls, 3)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].external_event_id, "2398396")
+        self.assertEqual(
+            events[0].starts_at_utc,
+            datetime(2026, 7, 30, 0, 30, tzinfo=timezone.utc),
+        )
+
+    def test_thesportsdb_resolves_team_id_when_event_search_has_no_history(self) -> None:
+        direct = response(200, {"event": None})
+        reverse = response(200, {"event": None})
+        team_search = response(
+            200,
+            {
+                "teams": [
+                    {
+                        "idTeam": "134296",
+                        "strTeam": "Fluminense",
+                        "strSport": "Soccer",
+                    }
+                ]
+            },
+        )
+        opponent_search = response(
+            200,
+            {
+                "teams": [
+                    {
+                        "idTeam": "134293",
+                        "strTeam": "Bahia",
+                        "strSport": "Soccer",
+                    }
+                ]
+            },
+        )
+        next_home_event = response(
+            200,
+            {
+                "events": [
+                    {
+                        "idEvent": "2398396",
+                        "strSport": "Soccer",
+                        "strHomeTeam": "Fluminense",
+                        "strAwayTeam": "Bahia",
+                        "strTimestamp": "2026-07-30T00:30:00Z",
+                    }
+                ]
+            },
+        )
+        session = ResponseSession(
+            [direct, reverse, team_search, opponent_search, next_home_event]
+        )
+        provider = TheSportsDbProvider(self.settings, self.store, session=session)
+
+        events = provider.search_events(
+            sport="football",
+            participants=("Fluminense", "Bahia"),
+            start_at_utc=datetime(2026, 7, 29, tzinfo=timezone.utc),
+            end_at_utc=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            deadline=9999999999.0,
+        )
+
+        self.assertEqual(session.calls, 5)
+        self.assertEqual([event.external_event_id for event in events], ["2398396"])
+
 
 class ProviderResilienceTests(unittest.TestCase):
     def test_http_429_does_not_retry_forever(self) -> None:

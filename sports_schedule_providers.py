@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import unicodedata
 from abc import ABC, abstractmethod
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -520,6 +521,7 @@ class TheSportsDbProvider(SportsScheduleProvider):
     name = "thesportsdb"
     supported_sports = frozenset({"football", "basketball", "tennis"})
     cache_scope = "participants"
+    cache_version = "team-schedule-v1"
 
     def search_events(
         self,
@@ -531,6 +533,7 @@ class TheSportsDbProvider(SportsScheduleProvider):
         deadline: float,
     ) -> list[ExternalSportsEvent]:
         events_by_id: dict[str, ExternalSportsEvent] = {}
+        team_ids: dict[str, str] = {}
         # A ordem no sinal nem sempre é mandante x visitante. O endpoint de
         # busca direta do TheSportsDB é consultado nas duas ordens para que o
         # matcher possa decidir com os mesmos critérios conservadores.
@@ -544,14 +547,152 @@ class TheSportsDbProvider(SportsScheduleProvider):
                 params={"e": query},
                 deadline=deadline,
             )
+            self._collect_team_ids(
+                payload,
+                sport=sport,
+                participants=participants,
+                destination=team_ids,
+            )
             for event in self._events_from_payload(payload):
                 events_by_id[event.external_event_id] = event
+
+        candidates = self._events_in_window(
+            events_by_id.values(),
+            sport=sport,
+            start_at_utc=start_at_utc,
+            end_at_utc=end_at_utc,
+        )
+        if _contains_exact_participant_pair(candidates, participants):
+            return candidates
+
+        # A chave gratuita limita a busca por nome e pode devolver apenas uma
+        # edição histórica do confronto. A agenda por time é usada somente
+        # quando não existe candidato dentro da janela solicitada.
+        for participant in participants:
+            participant_key = _provider_name_key(participant)
+            if participant_key in team_ids:
+                continue
+            payload = self._request_json(
+                (
+                    f"{self._settings.thesportsdb_base_url}/"
+                    f"{self._settings.thesportsdb_api_key}/searchteams.php"
+                ),
+                params={"t": participant},
+                deadline=deadline,
+            )
+            team_id = self._team_id_from_search(
+                payload,
+                sport=sport,
+                participant=participant,
+            )
+            if team_id is not None:
+                team_ids[participant_key] = team_id
+
+        queried_schedules: set[str] = set()
+        for endpoint in ("eventsnext.php", "eventslast.php"):
+            for participant in participants:
+                team_id = team_ids.get(_provider_name_key(participant))
+                if team_id is None:
+                    continue
+                query_identity = f"{endpoint}:{team_id}"
+                if query_identity in queried_schedules:
+                    continue
+                queried_schedules.add(query_identity)
+                payload = self._request_json(
+                    (
+                        f"{self._settings.thesportsdb_base_url}/"
+                        f"{self._settings.thesportsdb_api_key}/{endpoint}"
+                    ),
+                    params={"id": team_id},
+                    deadline=deadline,
+                )
+                for event in self._events_from_payload(payload):
+                    events_by_id[event.external_event_id] = event
+
+                candidates = self._events_in_window(
+                    events_by_id.values(),
+                    sport=sport,
+                    start_at_utc=start_at_utc,
+                    end_at_utc=end_at_utc,
+                )
+                if _contains_exact_participant_pair(candidates, participants):
+                    return candidates
+
+        return self._events_in_window(
+            events_by_id.values(),
+            sport=sport,
+            start_at_utc=start_at_utc,
+            end_at_utc=end_at_utc,
+        )
+
+    @staticmethod
+    def _events_in_window(
+        events: Any,
+        *,
+        sport: str,
+        start_at_utc: datetime,
+        end_at_utc: datetime,
+    ) -> list[ExternalSportsEvent]:
         return [
             event
-            for event in events_by_id.values()
+            for event in events
             if event.sport == sport
             and _utc(start_at_utc) <= event.starts_at_utc <= _utc(end_at_utc)
         ]
+
+    def _collect_team_ids(
+        self,
+        payload: Any,
+        *,
+        sport: str,
+        participants: tuple[str, str],
+        destination: dict[str, str],
+    ) -> None:
+        participant_keys = {_provider_name_key(item) for item in participants}
+        for item in _thesportsdb_items(payload):
+            if canonical_sport(_text(item.get("strSport")) or "") != sport:
+                continue
+            for name_field, id_field in (
+                ("strHomeTeam", "idHomeTeam"),
+                ("strAwayTeam", "idAwayTeam"),
+            ):
+                team_name = _text(item.get(name_field))
+                team_id = _text(item.get(id_field))
+                team_key = _provider_name_key(team_name or "")
+                if team_id and team_key in participant_keys:
+                    destination[team_key] = team_id
+
+    @staticmethod
+    def _team_id_from_search(
+        payload: Any,
+        *,
+        sport: str,
+        participant: str,
+    ) -> str | None:
+        if not isinstance(payload, dict) or not isinstance(payload.get("teams"), list):
+            return None
+        participant_key = _provider_name_key(participant)
+        for item in payload["teams"]:
+            if not isinstance(item, dict):
+                continue
+            if canonical_sport(_text(item.get("strSport")) or "") != sport:
+                continue
+            names = [
+                _text(item.get("strTeam")),
+                _text(item.get("strTeamShort")),
+                *str(item.get("strTeamAlternate") or "").split(","),
+            ]
+            normalized_names = {
+                _provider_name_key(name)
+                for name in names
+                if name is not None and str(name).strip()
+            }
+            if participant_key not in normalized_names:
+                continue
+            team_id = _text(item.get("idTeam"))
+            if team_id:
+                return team_id
+        return None
 
     def get_event(
         self,
@@ -571,17 +712,9 @@ class TheSportsDbProvider(SportsScheduleProvider):
         return events[0] if events else None
 
     def _events_from_payload(self, payload: Any) -> list[ExternalSportsEvent]:
-        if not isinstance(payload, dict):
-            return []
-        raw_items = payload.get("events")
-        if raw_items is None:
-            raw_items = payload.get("event")
-        if not isinstance(raw_items, list):
-            return []
         return [
             event
-            for item in raw_items
-            if isinstance(item, dict)
+            for item in _thesportsdb_items(payload)
             if (event := self._parse_event(item)) is not None
         ]
 
@@ -739,6 +872,43 @@ def _split_provider_event(value: str) -> tuple[str, str] | None:
         if len(parts) == 2 and all(part.strip() for part in parts):
             return parts[0].strip(), parts[1].strip()
     return None
+
+
+def _thesportsdb_items(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    raw_items = payload.get("events")
+    if raw_items is None:
+        raw_items = payload.get("event")
+    if not isinstance(raw_items, list):
+        return []
+    return [item for item in raw_items if isinstance(item, dict)]
+
+
+def _provider_name_key(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value).casefold())
+    return "".join(
+        char
+        for char in normalized
+        if not unicodedata.combining(char) and char.isalnum()
+    )
+
+
+def _contains_exact_participant_pair(
+    events: list[ExternalSportsEvent],
+    participants: tuple[str, str],
+) -> bool:
+    expected = sorted(_provider_name_key(item) for item in participants)
+    return any(
+        sorted(
+            (
+                _provider_name_key(event.participant_home),
+                _provider_name_key(event.participant_away),
+            )
+        )
+        == expected
+        for event in events
+    )
 
 
 def _retry_after_seconds(value: str | None) -> float:
