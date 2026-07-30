@@ -4,9 +4,12 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from sports_event_matching import (
+    BRAZILIAN_STATES,
     EventMatcher,
     ParticipantNormalizer,
+    brazilian_state_uf,
     canonical_sport,
+    split_event_participants,
 )
 from sports_event_models import ExternalSportsEvent
 
@@ -66,10 +69,43 @@ class ParticipantNormalizationTests(unittest.TestCase):
         )
 
     def test_vasco_variations_are_equivalent(self) -> None:
-        values = ("Vasco", "Vasco da Gama", "CR Vasco da Gama")
+        values = (
+            "Vasco",
+            "Vasco da Gama",
+            "CR Vasco da Gama",
+            "Vasco da Gama SAF",
+        )
         self.assertEqual(
             {self.normalizer.normalize(value) for value in values},
             {"vasco da gama"},
+        )
+
+    def test_unambiguous_brasileirao_aliases_are_equivalent(self) -> None:
+        cases = {
+            "atletico mineiro": ("Atlético Mineiro", "Atlético-MG"),
+            "athletico paranaense": (
+                "Athletico",
+                "Athletico-PR",
+                "Atlético-PR",
+                "Atlético Paranaense",
+            ),
+            "bragantino": ("Red Bull Bragantino", "Bragantino"),
+            "chapecoense": ("Chapecoense", "Chape"),
+            "internacional": ("Internacional", "Inter-RS"),
+            "coritiba": ("Coritiba", "Coritiba SAF"),
+        }
+        for expected, values in cases.items():
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    {self.normalizer.normalize(value) for value in values},
+                    {expected},
+                )
+
+    def test_ambiguous_inter_alias_is_not_globally_canonicalized(self) -> None:
+        self.assertEqual(self.normalizer.normalize("Inter"), "inter")
+        self.assertEqual(
+            self.normalizer.normalize("Inter Miami"),
+            "inter miami",
         )
 
     def test_incompatible_modalities_are_not_canonicalized(self) -> None:
@@ -77,6 +113,91 @@ class ParticipantNormalizationTests(unittest.TestCase):
         self.assertIsNone(canonical_sport("Tênis de mesa"))
         self.assertIsNone(canonical_sport("eSoccer"))
         self.assertEqual(canonical_sport("Futebol"), "football")
+
+    def test_brazilian_state_suffixes_do_not_reduce_club_matching(self) -> None:
+        for state_name, state_uf in BRAZILIAN_STATES.items():
+            with self.subTest(state=state_name):
+                self.assertEqual(
+                    self.normalizer.normalize(f"Clube Teste {state_uf}"),
+                    "teste",
+                )
+                self.assertEqual(
+                    self.normalizer.normalize(f"Clube Teste {state_name}"),
+                    "teste",
+                )
+
+    def test_state_name_alone_is_preserved_as_a_possible_club_name(self) -> None:
+        self.assertEqual(self.normalizer.normalize("Bahia"), "bahia")
+        self.assertEqual(self.normalizer.normalize("São Paulo"), "sao paulo")
+        self.assertEqual(self.normalizer.normalize("Amazonas FC"), "amazonas")
+
+
+class BrazilianStateRecoveryTests(unittest.TestCase):
+    def test_map_contains_all_states_and_federal_district(self) -> None:
+        self.assertEqual(len(BRAZILIAN_STATES), 27)
+        self.assertEqual(set(BRAZILIAN_STATES.values()), {
+            "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO",
+            "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI",
+            "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO",
+        })
+
+    def test_every_state_name_and_uf_recovers_extra_x_separator(self) -> None:
+        for state_name, state_uf in BRAZILIAN_STATES.items():
+            for state_token in (state_name, state_uf, state_uf.casefold()):
+                with self.subTest(state=state_name, token=state_token):
+                    self.assertEqual(brazilian_state_uf(state_token), state_uf)
+                    self.assertEqual(
+                        split_event_participants(
+                            f"Mandante x Visitante x {state_token}"
+                        ),
+                        ("Mandante", f"Visitante {state_uf}"),
+                    )
+
+    def test_state_names_are_accent_and_case_insensitive(self) -> None:
+        cases = {
+            "amapa": "AP",
+            "CEARA": "CE",
+            "distrito federal": "DF",
+            "espirito santo": "ES",
+            "goias": "GO",
+            "maranhao": "MA",
+            "para": "PA",
+            "paraiba": "PB",
+            "parana": "PR",
+            "piaui": "PI",
+            "rondonia": "RO",
+            "sao paulo": "SP",
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(brazilian_state_uf(value), expected)
+
+    def test_real_extra_x_case_is_recovered(self) -> None:
+        self.assertEqual(
+            split_event_participants("Corinthians x Athletico x PR"),
+            ("Corinthians", "Athletico PR"),
+        )
+
+    def test_extra_x_before_both_state_suffixes_is_recovered(self) -> None:
+        self.assertEqual(
+            split_event_participants("Corinthians x SP x Athletico x Paraná"),
+            ("Corinthians SP", "Athletico PR"),
+        )
+
+    def test_normal_two_participant_event_with_state_name_is_untouched(self) -> None:
+        self.assertEqual(
+            split_event_participants("Fluminense x Bahia"),
+            ("Fluminense", "Bahia"),
+        )
+        self.assertEqual(
+            split_event_participants("Palmeiras x São Paulo"),
+            ("Palmeiras", "São Paulo"),
+        )
+
+    def test_three_unknown_participants_remain_rejected(self) -> None:
+        self.assertIsNone(
+            split_event_participants("Time A x Time B x Time C")
+        )
 
 
 class ConservativeEventMatchingTests(unittest.TestCase):
@@ -104,6 +225,25 @@ class ConservativeEventMatchingTests(unittest.TestCase):
         )
         self.assertTrue(result.accepted)
         self.assertIn("participants_reversed", result.reasons)
+
+    def test_extra_x_before_state_suffix_matches_official_participants(self) -> None:
+        result = self.match(
+            "Corinthians x Athletico x PR",
+            [event("Corinthians", "Athletico Paranaense")],
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.participants, ("Corinthians", "Athletico PR"))
+
+    def test_standard_state_suffixes_match_names_without_suffixes(self) -> None:
+        result = self.match(
+            "Corinthians SP x Athletico Paranaense PR",
+            [event("Corinthians", "Athletico Paranaense")],
+        )
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.participant_1_score, 1.0)
+        self.assertEqual(result.participant_2_score, 1.0)
 
     def test_two_similar_events_are_rejected_as_ambiguous(self) -> None:
         result = self.match(

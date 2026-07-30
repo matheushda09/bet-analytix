@@ -38,9 +38,11 @@ class ResponseSession:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = 0
+        self.requests = []
 
     def get(self, *args, **kwargs):
         self.calls += 1
+        self.requests.append((args, kwargs))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -262,8 +264,8 @@ class ProviderPayloadParsingTests(unittest.TestCase):
             {
                 "teams": [
                     {
-                        "idTeam": "134296",
-                        "strTeam": "Fluminense",
+                        "idTeam": "134284",
+                        "strTeam": "Corinthians",
                         "strSport": "Soccer",
                     }
                 ]
@@ -274,8 +276,8 @@ class ProviderPayloadParsingTests(unittest.TestCase):
             {
                 "teams": [
                     {
-                        "idTeam": "134293",
-                        "strTeam": "Bahia",
+                        "idTeam": "134297",
+                        "strTeam": "Athletico Paranaense",
                         "strSport": "Soccer",
                     }
                 ]
@@ -286,11 +288,11 @@ class ProviderPayloadParsingTests(unittest.TestCase):
             {
                 "events": [
                     {
-                        "idEvent": "2398396",
+                        "idEvent": "2398394",
                         "strSport": "Soccer",
-                        "strHomeTeam": "Fluminense",
-                        "strAwayTeam": "Bahia",
-                        "strTimestamp": "2026-07-30T00:30:00Z",
+                        "strHomeTeam": "Corinthians",
+                        "strAwayTeam": "Athletico Paranaense",
+                        "strTimestamp": "2026-07-30T22:30:00Z",
                     }
                 ]
             },
@@ -302,14 +304,202 @@ class ProviderPayloadParsingTests(unittest.TestCase):
 
         events = provider.search_events(
             sport="football",
-            participants=("Fluminense", "Bahia"),
+            participants=("Corinthians SP", "Athletico Paranaense PR"),
             start_at_utc=datetime(2026, 7, 29, tzinfo=timezone.utc),
             end_at_utc=datetime(2026, 8, 1, tzinfo=timezone.utc),
             deadline=9999999999.0,
         )
 
         self.assertEqual(session.calls, 5)
-        self.assertEqual([event.external_event_id for event in events], ["2398396"])
+        self.assertEqual([event.external_event_id for event in events], ["2398394"])
+
+    def test_thesportsdb_normalizes_state_and_corporate_suffixes_before_search(self) -> None:
+        direct = response(200, {"event": None})
+        reverse = response(200, {"event": None})
+        home_search = response(
+            200,
+            {
+                "teams": [
+                    {
+                        "idTeam": "134291",
+                        "strTeam": "Coritiba",
+                        "strSport": "Soccer",
+                    }
+                ]
+            },
+        )
+        away_search = response(
+            200,
+            {
+                "teams": [
+                    {
+                        "idTeam": "134294",
+                        "strTeam": "Cruzeiro",
+                        "strSport": "Soccer",
+                    }
+                ]
+            },
+        )
+        next_home_event = response(
+            200,
+            {
+                "events": [
+                    {
+                        "idEvent": "2398395",
+                        "strSport": "Soccer",
+                        "strHomeTeam": "Coritiba",
+                        "strAwayTeam": "Cruzeiro",
+                        "strTimestamp": "2026-07-31T00:30:00Z",
+                    }
+                ]
+            },
+        )
+        session = ResponseSession(
+            [direct, reverse, home_search, away_search, next_home_event]
+        )
+        provider = TheSportsDbProvider(self.settings, self.store, session=session)
+
+        events = provider.search_events(
+            sport="football",
+            participants=("Coritiba SAF PR", "Cruzeiro MG"),
+            start_at_utc=datetime(2026, 7, 29, tzinfo=timezone.utc),
+            end_at_utc=datetime(2026, 8, 1, tzinfo=timezone.utc),
+            deadline=9999999999.0,
+        )
+
+        requested_params = [
+            request_kwargs["params"]
+            for _request_args, request_kwargs in session.requests
+        ]
+        self.assertEqual(requested_params[0], {"e": "coritiba_vs_cruzeiro"})
+        self.assertEqual(requested_params[1], {"e": "cruzeiro_vs_coritiba"})
+        self.assertEqual(requested_params[2], {"t": "coritiba"})
+        self.assertEqual(requested_params[3], {"t": "cruzeiro"})
+        self.assertEqual([event.external_event_id for event in events], ["2398395"])
+
+    def test_thesportsdb_uses_date_filter_when_free_next_event_is_another_game(self) -> None:
+        old_direct = response(
+            200,
+            {
+                "event": [
+                    {
+                        "idEvent": "old-1",
+                        "strSport": "Soccer",
+                        "strHomeTeam": "Bragantino",
+                        "idHomeTeam": "134736",
+                        "strAwayTeam": "Corinthians",
+                        "idAwayTeam": "134284",
+                        "strTimestamp": "2026-01-15T22:30:00Z",
+                    }
+                ]
+            },
+        )
+        reverse = response(200, {"event": None})
+        other_schedule_responses = [
+            response(
+                200,
+                {
+                    "events": [
+                        {
+                            "idEvent": f"other-{index}",
+                            "strSport": "Soccer",
+                            "strHomeTeam": "Outro",
+                            "strAwayTeam": "Adversário",
+                            "strTimestamp": "2026-08-09T18:00:00Z",
+                        }
+                    ]
+                },
+            )
+            for index in range(4)
+        ]
+        date_filtered = response(
+            200,
+            {
+                "event": [
+                    {
+                        "idEvent": "2398403",
+                        "strSport": "Soccer",
+                        "strHomeTeam": "Bragantino",
+                        "strAwayTeam": "Corinthians",
+                        "strTimestamp": "2026-08-09T21:30:00Z",
+                    }
+                ]
+            },
+        )
+        session = ResponseSession(
+            [old_direct, reverse, *other_schedule_responses, date_filtered]
+        )
+        provider = TheSportsDbProvider(self.settings, self.store, session=session)
+
+        events = provider.search_events(
+            sport="football",
+            participants=("Red Bull Bragantino SP", "Corinthians SP"),
+            start_at_utc=datetime(2026, 8, 9, tzinfo=timezone.utc),
+            end_at_utc=datetime(2026, 8, 9, 23, 59, tzinfo=timezone.utc),
+            deadline=9999999999.0,
+        )
+
+        self.assertEqual(session.calls, 7)
+        self.assertEqual(
+            session.requests[-1][1]["params"],
+            {"e": "bragantino_vs_corinthians", "d": "2026-08-09"},
+        )
+        self.assertIn(
+            "2398403",
+            {event.external_event_id for event in events},
+        )
+
+    def test_thesportsdb_default_window_stays_below_free_minute_limit(self) -> None:
+        home_search = response(
+            200,
+            {
+                "teams": [
+                    {
+                        "idTeam": "134736",
+                        "strTeam": "Bragantino",
+                        "strSport": "Soccer",
+                    }
+                ]
+            },
+        )
+        away_search = response(
+            200,
+            {
+                "teams": [
+                    {
+                        "idTeam": "134284",
+                        "strTeam": "Corinthians",
+                        "strSport": "Soccer",
+                    }
+                ]
+            },
+        )
+        session = ResponseSession(
+            [
+                response(200, {"event": None}),
+                response(200, {"event": None}),
+                home_search,
+                away_search,
+                *[response(200, {"events": None}) for _index in range(4)],
+                *[response(200, {"event": None}) for _index in range(18)],
+            ]
+        )
+        provider = TheSportsDbProvider(self.settings, self.store, session=session)
+
+        events = provider.search_events(
+            sport="football",
+            participants=("Bragantino", "Corinthians"),
+            start_at_utc=datetime(2026, 8, 6, 12, tzinfo=timezone.utc),
+            end_at_utc=datetime(2026, 8, 14, 12, tzinfo=timezone.utc),
+            deadline=9999999999.0,
+        )
+
+        self.assertEqual(events, [])
+        self.assertEqual(session.calls, 26)
+        self.assertLessEqual(
+            session.calls,
+            self.settings.provider_minute_limits["thesportsdb"],
+        )
 
 
 class ProviderResilienceTests(unittest.TestCase):

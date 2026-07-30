@@ -21,6 +21,74 @@ COMPOSITE_EVENT_SEPARATOR = re.compile(r"\s*/\s*")
 NON_ALNUM = re.compile(r"[^a-z0-9]+")
 SPACE = re.compile(r"\s+")
 
+BRAZILIAN_STATES: dict[str, str] = {
+    "Acre": "AC",
+    "Alagoas": "AL",
+    "Amapá": "AP",
+    "Amazonas": "AM",
+    "Bahia": "BA",
+    "Ceará": "CE",
+    "Distrito Federal": "DF",
+    "Espírito Santo": "ES",
+    "Goiás": "GO",
+    "Maranhão": "MA",
+    "Mato Grosso": "MT",
+    "Mato Grosso do Sul": "MS",
+    "Minas Gerais": "MG",
+    "Pará": "PA",
+    "Paraíba": "PB",
+    "Paraná": "PR",
+    "Pernambuco": "PE",
+    "Piauí": "PI",
+    "Rio de Janeiro": "RJ",
+    "Rio Grande do Norte": "RN",
+    "Rio Grande do Sul": "RS",
+    "Rondônia": "RO",
+    "Roraima": "RR",
+    "Santa Catarina": "SC",
+    "São Paulo": "SP",
+    "Sergipe": "SE",
+    "Tocantins": "TO",
+}
+
+
+def _normalize_lookup_text(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", str(value).casefold())
+    without_marks = "".join(
+        char for char in decomposed if not unicodedata.combining(char)
+    )
+    return SPACE.sub(" ", NON_ALNUM.sub(" ", without_marks)).strip()
+
+
+BRAZILIAN_STATE_UF_BY_TOKEN: dict[str, str] = {
+    **{
+        _normalize_lookup_text(state_name): uf
+        for state_name, uf in BRAZILIAN_STATES.items()
+    },
+    **{uf.casefold(): uf for uf in BRAZILIAN_STATES.values()},
+}
+BRAZILIAN_STATE_SUFFIXES: tuple[tuple[tuple[str, ...], str], ...] = tuple(
+    sorted(
+        (
+            (tuple(token.split()), uf)
+            for token, uf in BRAZILIAN_STATE_UF_BY_TOKEN.items()
+        ),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+)
+
+
+def _without_brazilian_state_suffix(tokens: list[str]) -> list[str]:
+    for state_tokens, _state_uf in BRAZILIAN_STATE_SUFFIXES:
+        suffix_size = len(state_tokens)
+        if len(tokens) <= suffix_size:
+            continue
+        if tuple(tokens[-suffix_size:]) == state_tokens:
+            return tokens[:-suffix_size]
+    return tokens
+
+
 SPORT_ALIASES: dict[str, set[str]] = {
     "football": {"futebol", "football", "soccer", "association football"},
     "basketball": {"basquete", "basketball", "basket ball"},
@@ -33,9 +101,16 @@ SPORT_FORBIDDEN_TERMS: dict[str, set[str]] = {
 }
 
 DEFAULT_PARTICIPANT_ALIASES: dict[str, str] = {
+    "atletico mg": "atletico mineiro",
+    "atletico pr": "athletico paranaense",
+    "atletico paranaense": "athletico paranaense",
+    "athletico": "athletico paranaense",
     "athletico pr": "athletico paranaense",
     "club athletico paranaense": "athletico paranaense",
     "cap": "athletico paranaense",
+    "red bull bragantino": "bragantino",
+    "chape": "chapecoense",
+    "inter rs": "internacional",
     "sc corinthians paulista": "corinthians",
     "sport club corinthians paulista": "corinthians",
     "corinthians paulista": "corinthians",
@@ -59,6 +134,7 @@ REMOVABLE_CLUB_TOKENS = {
     "football",
     "esporte",
     "sport",
+    "saf",
 }
 
 CATEGORY_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
@@ -132,6 +208,7 @@ class ParticipantNormalizer:
         base = self._base_normalize(value)
         aliased = self._aliases.get(base, base)
         tokens = [token for token in aliased.split() if token not in REMOVABLE_CLUB_TOKENS]
+        tokens = _without_brazilian_state_suffix(tokens)
         cleaned = " ".join(tokens)
         return self._aliases.get(cleaned, cleaned)
 
@@ -151,11 +228,7 @@ class ParticipantNormalizer:
 
     @staticmethod
     def _base_normalize(value: str) -> str:
-        decomposed = unicodedata.normalize("NFKD", str(value).casefold())
-        without_marks = "".join(
-            char for char in decomposed if not unicodedata.combining(char)
-        )
-        return SPACE.sub(" ", NON_ALNUM.sub(" ", without_marks)).strip()
+        return _normalize_lookup_text(value)
 
 
 def canonical_sport(value: str) -> str | None:
@@ -171,15 +244,40 @@ def canonical_sport(value: str) -> str | None:
     return None
 
 
+def brazilian_state_uf(value: str) -> str | None:
+    """Resolve nome completo ou sigla de uma unidade federativa brasileira."""
+
+    return BRAZILIAN_STATE_UF_BY_TOKEN.get(_normalize_lookup_text(value))
+
+
 def split_event_participants(event_name: str) -> tuple[str, str] | None:
     # Uma barra indica potencial evento composto e precisa ser validada pela
     # rotina própria; nunca deve virar parte do nome de um participante.
     if "/" in event_name:
         return None
     parts = [part.strip() for part in EVENT_SEPARATOR.split(event_name.strip())]
+    if len(parts) > 2:
+        parts = _recover_brazilian_state_separators(parts)
     if len(parts) != 2 or not all(parts):
         return None
     return parts[0], parts[1]
+
+
+def _recover_brazilian_state_separators(parts: list[str]) -> list[str]:
+    """Recompõe UFs separadas do clube por um ``x`` digitado indevidamente."""
+
+    if len(parts) <= 2 or brazilian_state_uf(parts[-1]) is None:
+        return parts
+
+    recovered = list(parts)
+    index = len(recovered) - 1
+    while index > 0 and len(recovered) > 2:
+        state_uf = brazilian_state_uf(recovered[index])
+        if state_uf is not None:
+            recovered[index - 1] = f"{recovered[index - 1]} {state_uf}".strip()
+            del recovered[index]
+        index -= 1
+    return recovered
 
 
 def split_composite_event_legs(event_name: str) -> tuple[str, ...] | None:

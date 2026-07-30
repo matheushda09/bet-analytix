@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import time
-import unicodedata
 from abc import ABC, abstractmethod
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -12,12 +11,13 @@ from typing import Any
 import requests
 
 from sports_event_config import SportsEventSettings
-from sports_event_matching import canonical_sport
+from sports_event_matching import ParticipantNormalizer, canonical_sport
 from sports_event_models import ExternalSportsEvent
 from sports_schedule_store import SportsScheduleStore
 
 
 logger = logging.getLogger(__name__)
+PROVIDER_PARTICIPANT_NORMALIZER = ParticipantNormalizer()
 
 
 class SportsProviderError(RuntimeError):
@@ -521,7 +521,7 @@ class TheSportsDbProvider(SportsScheduleProvider):
     name = "thesportsdb"
     supported_sports = frozenset({"football", "basketball", "tennis"})
     cache_scope = "participants"
-    cache_version = "team-schedule-v1"
+    cache_version = "team-schedule-v2"
 
     def search_events(
         self,
@@ -534,10 +534,17 @@ class TheSportsDbProvider(SportsScheduleProvider):
     ) -> list[ExternalSportsEvent]:
         events_by_id: dict[str, ExternalSportsEvent] = {}
         team_ids: dict[str, str] = {}
+        query_participants = tuple(
+            PROVIDER_PARTICIPANT_NORMALIZER.normalize(participant) or participant
+            for participant in participants
+        )
         # A ordem no sinal nem sempre é mandante x visitante. O endpoint de
         # busca direta do TheSportsDB é consultado nas duas ordens para que o
         # matcher possa decidir com os mesmos critérios conservadores.
-        for first, second in (participants, tuple(reversed(participants))):
+        for first, second in (
+            query_participants,
+            tuple(reversed(query_participants)),
+        ):
             query = f"{first}_vs_{second}".replace(" ", "_")
             payload = self._request_json(
                 (
@@ -568,7 +575,7 @@ class TheSportsDbProvider(SportsScheduleProvider):
         # A chave gratuita limita a busca por nome e pode devolver apenas uma
         # edição histórica do confronto. A agenda por time é usada somente
         # quando não existe candidato dentro da janela solicitada.
-        for participant in participants:
+        for participant in query_participants:
             participant_key = _provider_name_key(participant)
             if participant_key in team_ids:
                 continue
@@ -590,7 +597,7 @@ class TheSportsDbProvider(SportsScheduleProvider):
 
         queried_schedules: set[str] = set()
         for endpoint in ("eventsnext.php", "eventslast.php"):
-            for participant in participants:
+            for participant in query_participants:
                 team_id = team_ids.get(_provider_name_key(participant))
                 if team_id is None:
                     continue
@@ -604,6 +611,37 @@ class TheSportsDbProvider(SportsScheduleProvider):
                         f"{self._settings.thesportsdb_api_key}/{endpoint}"
                     ),
                     params={"id": team_id},
+                    deadline=deadline,
+                )
+                for event in self._events_from_payload(payload):
+                    events_by_id[event.external_event_id] = event
+
+                candidates = self._events_in_window(
+                    events_by_id.values(),
+                    sport=sport,
+                    start_at_utc=start_at_utc,
+                    end_at_utc=end_at_utc,
+                )
+                if _contains_exact_participant_pair(candidates, participants):
+                    return candidates
+
+        # A chave gratuita retorna somente o próximo jogo em casa de cada
+        # equipe. Se houver outra competição antes do confronto procurado,
+        # esse recorte não alcança o evento mesmo quando ele já existe na
+        # base. A busca nominal com filtro de data continua sendo gratuita e
+        # permite varrer a pequena janela configurada sem aceitar um homônimo.
+        for event_date in _dates_between(start_at_utc, end_at_utc):
+            for first, second in (
+                query_participants,
+                tuple(reversed(query_participants)),
+            ):
+                query = f"{first}_vs_{second}".replace(" ", "_")
+                payload = self._request_json(
+                    (
+                        f"{self._settings.thesportsdb_base_url}/"
+                        f"{self._settings.thesportsdb_api_key}/searchevents.php"
+                    ),
+                    params={"e": query, "d": event_date.isoformat()},
                     deadline=deadline,
                 )
                 for event in self._events_from_payload(payload):
@@ -886,11 +924,10 @@ def _thesportsdb_items(payload: Any) -> list[dict[str, Any]]:
 
 
 def _provider_name_key(value: str) -> str:
-    normalized = unicodedata.normalize("NFKD", str(value).casefold())
     return "".join(
         char
-        for char in normalized
-        if not unicodedata.combining(char) and char.isalnum()
+        for char in PROVIDER_PARTICIPANT_NORMALIZER.normalize(value)
+        if char.isalnum()
     )
 
 
