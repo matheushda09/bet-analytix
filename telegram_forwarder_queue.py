@@ -48,7 +48,7 @@ class ForwarderQueue:
 
         if message.grouped_id is None:
             payload = build_discord_payload(message, media_files)
-            await self._enqueue(payload)
+            await self.enqueue(payload)
             return
 
         await self._add_to_album(message, media_files)
@@ -116,9 +116,15 @@ class ForwarderQueue:
             grouped_id=first.grouped_id,
             text=combined_text,
             media_files=all_media_files,
+            reply_to_telegram_message_id=first.reply_to_message_id,
             reply_to_discord_message_id=None,
             sent_at=first.sent_at,
         )
+
+        await self.enqueue(payload)
+
+    async def enqueue(self, payload: DiscordPayload) -> None:
+        """Metodo publico para adicionar um payload pronto diretamente a fila."""
 
         await self._enqueue(payload)
 

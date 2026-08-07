@@ -113,6 +113,7 @@ def apply_sqlite_defaults(
     elif service_type == "forwarder":
         defaults.append(("TF_TELEGRAM_SESSION_PATH", f"data/{lower_name}_telegram_forwarder.session"))
         defaults.append(("TF_MEDIA_DOWNLOAD_DIR", f"data/{lower_name}_telegram_forwarder_media"))
+        defaults.append(("TF_SQLITE_PATH", f"data/{lower_name}_telegram_forwarder.sqlite3"))
 
     for var_name, default_path in defaults:
         if var_name not in overrides:

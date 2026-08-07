@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +11,7 @@ import discord
 
 from telegram_forwarder_config import TelegramForwarderSettings
 from telegram_forwarder_models import DiscordPayload
+from telegram_forwarder_store import TelegramForwarderStore
 
 
 logger = logging.getLogger(__name__)
@@ -21,22 +21,22 @@ MAX_TEXT_LENGTH = 2000
 
 
 class DiscordForwarderClient(discord.Client):
-    """Self-bot que apenas posta mensagens no canal alvo."""
+    """Self-bot que posta mensagens e comentarios (threads) no canal alvo."""
 
-    def __init__(self, settings: TelegramForwarderSettings) -> None:
-        # Intents minimos; self-bot nao precisa de intents especiais para enviar.
-        intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(intents=intents)
+    def __init__(
+        self,
+        settings: TelegramForwarderSettings,
+        store: TelegramForwarderStore,
+    ) -> None:
+        # discord.py-self nao usa Intents; self-bot nao precisa deles para enviar.
+        super().__init__()
 
         self._settings = settings
+        self._store = store
         self._target_channel_id = settings.destiny_discord_channel_id
         self._guild_id = settings.destiny_discord_guild_id
         self._rate_limit_interval = 1.0 / max(0.01, settings.rate_limit_messages_per_second)
         self._last_send_time: float = 0.0
-        self._message_map: dict[int, int] = {}
-        self._map_lock = asyncio.Lock()
-        self._max_map_size = 5000
         self._ready_event = asyncio.Event()
         self._shutdown = False
 
@@ -54,48 +54,31 @@ class DiscordForwarderClient(discord.Client):
         await self._ready_event.wait()
 
     async def post_payload(self, payload: DiscordPayload) -> None:
-        """Envia um payload ao canal Discord."""
+        """Envia uma mensagem normal ao canal Discord."""
 
         await self.wait_until_ready()
 
-        channel = self.get_channel(self._target_channel_id)
-        if channel is None:
-            channel = await self.fetch_channel(self._target_channel_id)
-
-        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-            raise RuntimeError(
-                f"Canal Discord invalido ou inacessivel: {self._target_channel_id} (tipo={type(channel).__name__})"
-            )
+        channel = await self._resolve_channel(self._target_channel_id)
 
         # Throttle local simples.
-        now = asyncio.get_event_loop().time()
-        elapsed = now - self._last_send_time
-        if elapsed < self._rate_limit_interval:
-            await asyncio.sleep(self._rate_limit_interval - elapsed)
+        await self._throttle()
 
-        reference = None
-        if payload.reply_to_discord_message_id is not None:
-            try:
-                reference = discord.MessageReference(
-                    message_id=payload.reply_to_discord_message_id,
-                    channel_id=self._target_channel_id,
-                    guild_id=self._guild_id,
-                )
-            except Exception:
-                logger.exception("Falha ao montar message reference; prosseguindo sem reply.")
-
+        reference = self._build_reference(payload.reply_to_discord_message_id)
         text = self._sanitize_text(payload.text)
-        files = payload.media_files
 
         try:
             discord_message = await self._send_to_channel(
                 channel=channel,
                 text=text,
-                files=files,
+                files=payload.media_files,
                 reference=reference,
                 payload=payload,
             )
-            await self._register_mapping(payload.telegram_message_id, discord_message.id)
+            await self._persist_mapping(
+                payload.telegram_chat_id,
+                payload.telegram_message_id,
+                discord_message.id,
+            )
             logger.info(
                 "Mensagem enviada ao Discord: telegram_id=%s discord_id=%s",
                 payload.telegram_message_id,
@@ -110,11 +93,15 @@ class DiscordForwarderClient(discord.Client):
                 discord_message = await self._send_to_channel(
                     channel=channel,
                     text=text,
-                    files=files,
+                    files=payload.media_files,
                     reference=None,
                     payload=payload,
                 )
-                await self._register_mapping(payload.telegram_message_id, discord_message.id)
+                await self._persist_mapping(
+                    payload.telegram_chat_id,
+                    payload.telegram_message_id,
+                    discord_message.id,
+                )
                 logger.info(
                     "Mensagem enviada ao Discord (sem reply): telegram_id=%s discord_id=%s",
                     payload.telegram_message_id,
@@ -124,6 +111,111 @@ class DiscordForwarderClient(discord.Client):
                 raise
         finally:
             self._last_send_time = asyncio.get_event_loop().time()
+
+    async def post_comment(
+        self,
+        payload: DiscordPayload,
+        telegram_channel_message_id: int,
+    ) -> None:
+        """Envia um comentario do Telegram como mensagem numa thread do Discord."""
+
+        await self.wait_until_ready()
+        await self._throttle()
+
+        channel = await self._resolve_channel(self._target_channel_id)
+
+        thread_id = self._store.get_discord_thread_id(telegram_channel_message_id)
+        thread: discord.Thread | None = None
+
+        if thread_id is not None:
+            thread = self.get_channel(thread_id)
+            if thread is None:
+                try:
+                    thread = await self.fetch_channel(thread_id)
+                except Exception:
+                    logger.warning("Thread %s nao encontrada; criando nova.", thread_id)
+                    thread = None
+
+        if thread is None:
+            discord_message_id = self._store.get_discord_message_id(
+                self._settings.source_chat_id,
+                telegram_channel_message_id,
+            )
+            if discord_message_id is None:
+                raise RuntimeError(
+                    f"Mensagem do canal {telegram_channel_message_id} ainda nao foi enviada ao Discord; "
+                    "nao e possivel criar thread de comentarios."
+                )
+
+            parent_message = await channel.fetch_message(discord_message_id)
+            thread_name = self._thread_name_from_text(payload.text)
+            try:
+                thread = await channel.create_thread(
+                    name=thread_name,
+                    message=parent_message,
+                    type=discord.ChannelType.public_thread,
+                    auto_archive_duration=10080,  # 7 dias
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Falha ao criar thread para mensagem {telegram_channel_message_id}: {exc}"
+                ) from exc
+
+            self._store.save_thread_mapping(telegram_channel_message_id, thread.id)
+            logger.info(
+                "Thread criada no Discord: telegram_channel_message_id=%s discord_thread_id=%s",
+                telegram_channel_message_id,
+                thread.id,
+            )
+
+        if not isinstance(thread, discord.Thread):
+            raise RuntimeError(f"Canal retornado nao e uma thread: {type(thread).__name__}")
+
+        text = self._sanitize_text(payload.text)
+        await self._send_to_channel(
+            channel=thread,
+            text=text,
+            files=payload.media_files,
+            reference=None,
+            payload=payload,
+        )
+        logger.info(
+            "Comentario enviado para thread: telegram_message_id=%s discord_thread_id=%s",
+            payload.telegram_message_id,
+            thread.id,
+        )
+
+        self._last_send_time = asyncio.get_event_loop().time()
+
+    async def _resolve_channel(self, channel_id: int) -> discord.TextChannel | discord.Thread:
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            channel = await self.fetch_channel(channel_id)
+
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+            raise RuntimeError(
+                f"Canal Discord invalido ou inacessivel: {channel_id} (tipo={type(channel).__name__})"
+            )
+        return channel
+
+    async def _throttle(self) -> None:
+        now = asyncio.get_event_loop().time()
+        elapsed = now - self._last_send_time
+        if elapsed < self._rate_limit_interval:
+            await asyncio.sleep(self._rate_limit_interval - elapsed)
+
+    def _build_reference(self, discord_message_id: int | None) -> discord.MessageReference | None:
+        if discord_message_id is None:
+            return None
+        try:
+            return discord.MessageReference(
+                message_id=discord_message_id,
+                channel_id=self._target_channel_id,
+                guild_id=self._guild_id,
+            )
+        except Exception:
+            logger.exception("Falha ao montar message reference; prosseguindo sem reply.")
+            return None
 
     async def _send_to_channel(
         self,
@@ -214,19 +306,35 @@ class DiscordForwarderClient(discord.Client):
 
         return first_discord_message
 
-    async def _register_mapping(self, telegram_message_id: int, discord_message_id: int) -> None:
-        """Mantem mapeamento telegram_id -> discord_id para replies futuros."""
+    async def _persist_mapping(
+        self,
+        telegram_chat_id: int,
+        telegram_message_id: int,
+        discord_message_id: int,
+    ) -> None:
+        """Persiste mapeamento no SQLite e mantem cache em memoria."""
 
-        async with self._map_lock:
-            self._message_map[telegram_message_id] = discord_message_id
-            # Evita crescimento ilimitado; remove entradas mais antigas.
-            if len(self._message_map) > self._max_map_size:
-                keys_to_remove = list(self._message_map.keys())[: len(self._message_map) - self._max_map_size]
-                for key in keys_to_remove:
-                    del self._message_map[key]
+        try:
+            self._store.save_message_mapping(
+                telegram_chat_id,
+                telegram_message_id,
+                discord_message_id,
+            )
+        except Exception:
+            logger.exception(
+                "Falha ao persistir mapeamento telegram_chat_id=%s telegram_message_id=%s",
+                telegram_chat_id,
+                telegram_message_id,
+            )
 
-    def get_discord_message_id(self, telegram_message_id: int) -> int | None:
-        return self._message_map.get(telegram_message_id)
+    def resolve_discord_message_id(
+        self,
+        telegram_chat_id: int,
+        telegram_message_id: int,
+    ) -> int | None:
+        """Resolve o discord_message_id a partir do store."""
+
+        return self._store.get_discord_message_id(telegram_chat_id, telegram_message_id)
 
     @staticmethod
     def _sanitize_text(text: str) -> str:
@@ -237,6 +345,17 @@ class DiscordForwarderClient(discord.Client):
         if len(text) <= MAX_TEXT_LENGTH:
             return text
         return text[: MAX_TEXT_LENGTH - 3] + "..."
+
+    @staticmethod
+    def _thread_name_from_text(text: str) -> str:
+        """Gera um nome curto para a thread baseado no texto."""
+
+        clean = text.replace("\n", " ").strip()
+        if not clean:
+            return "Comentarios"
+        if len(clean) <= 80:
+            return clean
+        return clean[:77] + "..."
 
     async def close(self) -> None:
         self._shutdown = True

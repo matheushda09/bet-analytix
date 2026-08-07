@@ -20,6 +20,8 @@ class TelegramForwarderSettings:
     telegram_phone: str
     telegram_session_path: Path
     source_chat_id: int
+    source_comments_chat_id: int | None
+    sqlite_path: Path
     destiny_discord_user_token: str
     destiny_discord_channel_id: int
     destiny_discord_guild_id: int | None
@@ -53,6 +55,8 @@ def load_telegram_forwarder_settings(env_path: str | Path = ".env") -> TelegramF
         telegram_phone=phone,
         telegram_session_path=Path(_get_str("TF_TELEGRAM_SESSION_PATH", "data/telegram_forwarder.session")),
         source_chat_id=source_chat_id,
+        source_comments_chat_id=_get_optional_int("TF_SOURCE_COMMENTS_CHAT_ID"),
+        sqlite_path=Path(_get_str("TF_SQLITE_PATH", "data/telegram_forwarder.sqlite3")),
         destiny_discord_user_token=discord_token,
         destiny_discord_channel_id=discord_channel_id,
         destiny_discord_guild_id=_get_optional_int("TF_DESTINY_DISCORD_GUILD_ID"),

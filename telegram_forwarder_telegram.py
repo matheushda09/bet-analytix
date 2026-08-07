@@ -36,6 +36,13 @@ class TelegramForwarderClient:
     ) -> None:
         self._settings = settings
         self._queue = queue
+
+        # Garante que os diretorios existem antes de instanciar o TelegramClient,
+        # pois o arquivo .session e um banco SQLite e precisa de pasta valida.
+        settings.telegram_session_path.parent.mkdir(parents=True, exist_ok=True)
+        self._media_dir = settings.media_download_dir
+        self._media_dir.mkdir(parents=True, exist_ok=True)
+
         self._client = TelegramClient(
             str(settings.telegram_session_path),
             settings.telegram_api_id,
@@ -51,9 +58,6 @@ class TelegramForwarderClient:
             retry_delay=5,
             flood_sleep_threshold=120,
         )
-        self._media_dir = settings.media_download_dir
-        self._media_dir.mkdir(parents=True, exist_ok=True)
-        settings.telegram_session_path.parent.mkdir(parents=True, exist_ok=True)
         self._running = False
         self._message_handler_registered = False
 
@@ -74,9 +78,12 @@ class TelegramForwarderClient:
         logger.info("Cliente Telethon conectado: user_id=%s", me.id if me else None)
 
         if not self._message_handler_registered:
+            chats = [self._settings.source_chat_id]
+            if self._settings.source_comments_chat_id is not None:
+                chats.append(self._settings.source_comments_chat_id)
             self._client.add_event_handler(
                 self._on_new_message,
-                events.NewMessage(chats=[self._settings.source_chat_id]),
+                events.NewMessage(chats=chats),
             )
             self._message_handler_registered = True
 
@@ -88,25 +95,36 @@ class TelegramForwarderClient:
 
         logger.info("Sessao nao autorizada; solicitando codigo para %s", self._settings.telegram_phone)
         await self._client.send_code_request(self._settings.telegram_phone)
-        try:
-            code = input(f"Digite o codigo Telegram enviado para {self._settings.telegram_phone}: ").strip()
-        except EOFError:
-            raise RuntimeError(
-                "Sessao Telegram nao autorizada e entrada interativa indisponivel. "
-                "Autorize localmente primeiro (rode uma vez no terminal)."
-            )
+
+        code = await self._ask_input(
+            f"Digite o codigo Telegram enviado para {self._settings.telegram_phone}: "
+        )
+        if not code:
+            raise RuntimeError("Codigo de autorizacao nao fornecido.")
+
         try:
             await self._client.sign_in(self._settings.telegram_phone, code)
         except Exception as first_exc:
-            if "2FA" in str(first_exc) or "password" in str(first_exc).lower():
-                try:
-                    password = input("Conta com 2FA. Digite a senha: ").strip()
-                except EOFError:
-                    raise RuntimeError("2FA necessario e entrada interativa indisponivel.") from first_exc
+            error_text = str(first_exc)
+            if "2FA" in error_text or "password" in error_text.lower():
+                password = await self._ask_input("Conta com 2FA. Digite a senha: ")
+                if not password:
+                    raise RuntimeError("Senha 2FA nao fornecida.") from first_exc
                 await self._client.sign_in(password=password)
             else:
                 raise
         logger.info("Sessao Telegram autorizada e salva em %s.", self._settings.telegram_session_path)
+
+    async def _ask_input(self, prompt: str) -> str:
+        """Le input do terminal sem bloquear o event loop do asyncio."""
+
+        try:
+            return (await asyncio.to_thread(input, prompt)).strip()
+        except EOFError:
+            raise RuntimeError(
+                "Entrada interativa indisponivel. "
+                "Autorize a sessao localmente em um terminal real."
+            )
 
     async def stop(self) -> None:
         """Para o cliente de forma limpa."""
@@ -118,7 +136,7 @@ class TelegramForwarderClient:
             logger.exception("Falha ao desconectar cliente Telethon.")
 
     async def _on_new_message(self, event: events.NewMessage.Event) -> None:
-        """Handler de novas mensagens no chat monitorado."""
+        """Handler de novas mensagens nos chats monitorados."""
 
         message = event.message
         if message is None:
@@ -130,27 +148,90 @@ class TelegramForwarderClient:
             return
 
         chat_id = message.chat_id
-        if chat_id != self._settings.source_chat_id:
-            return
 
         try:
-            tg_message, media_files = await self._extract_message(message)
-            if tg_message is None:
-                return
-            logger.info(
-                "Mensagem Telegram capturada: message_id=%s chat_id=%s grouped_id=%s sender=%s media=%s",
-                tg_message.telegram_message_id,
-                tg_message.telegram_chat_id,
-                tg_message.grouped_id,
-                tg_message.sender_name,
-                len(media_files),
-            )
-            await self._queue.put_message(tg_message, media_files)
+            if chat_id == self._settings.source_chat_id:
+                await self._handle_channel_message(message)
+            elif chat_id == self._settings.source_comments_chat_id:
+                await self._handle_comment_message(message)
+            else:
+                logger.debug("Mensagem ignorada de chat nao monitorado: chat_id=%s", chat_id)
         except Exception:
             logger.exception(
                 "Falha ao processar mensagem Telegram message_id=%s; listener continua.",
                 getattr(message, "id", None),
             )
+
+    async def _handle_channel_message(self, message) -> None:
+        """Processa uma mensagem do canal de origem."""
+
+        tg_message, media_files = await self._extract_message(message)
+        if tg_message is None:
+            return
+        logger.info(
+            "Mensagem Telegram capturada: message_id=%s chat_id=%s grouped_id=%s sender=%s media=%s",
+            tg_message.telegram_message_id,
+            tg_message.telegram_chat_id,
+            tg_message.grouped_id,
+            tg_message.sender_name,
+            len(media_files),
+        )
+        await self._queue.put_message(tg_message, media_files)
+
+    async def _handle_comment_message(self, message) -> None:
+        """Processa um comentario do grupo de discussao vinculado."""
+
+        channel_message_id = self._resolve_comment_target(message)
+        if channel_message_id is None:
+            logger.debug(
+                "Comentario ignorado pois nao conseguiu identificar mensagem do canal: message_id=%s",
+                message.id,
+            )
+            return
+
+        tg_message, media_files = await self._extract_message(message)
+        if tg_message is None:
+            return
+
+        logger.info(
+            "Comentario Telegram capturado: message_id=%s chat_id=%s target_channel_message_id=%s sender=%s",
+            tg_message.telegram_message_id,
+            tg_message.telegram_chat_id,
+            channel_message_id,
+            tg_message.sender_name,
+        )
+
+        # Sobrescreve flags para identificar como comentario.
+        payload = build_discord_payload(tg_message, media_files)
+        object.__setattr__(payload, "is_comment", True)
+        object.__setattr__(payload, "telegram_channel_message_id", channel_message_id)
+        await self._queue.enqueue(payload)
+
+    def _resolve_comment_target(self, message) -> int | None:
+        """Tenta extrair o ID da mensagem do canal original a partir de um comentario."""
+
+        reply_to = getattr(message, "reply_to", None)
+        if reply_to is None:
+            return None
+
+        # Comentarios no Telegram referenciam a mensagem do canal via reply_to_msg_id.
+        for attr in ("reply_to_msg_id", "reply_to_top_id"):
+            value = getattr(reply_to, attr, None)
+            if value is not None:
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+
+        # Fallback: reply_to pode ter um atributo message_id direto em algumas versoes.
+        message_id = getattr(reply_to, "message_id", None)
+        if message_id is not None:
+            try:
+                return int(message_id)
+            except (TypeError, ValueError):
+                pass
+
+        return None
 
     async def _extract_message(
         self,

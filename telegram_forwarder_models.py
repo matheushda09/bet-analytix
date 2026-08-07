@@ -51,8 +51,11 @@ class DiscordPayload:
     grouped_id: int | None
     text: str
     media_files: list[Path]
+    reply_to_telegram_message_id: int | None
     reply_to_discord_message_id: int | None
     sent_at: datetime
+    is_comment: bool = False
+    telegram_channel_message_id: int | None = None
 
 
 def build_discord_payload(
@@ -68,6 +71,7 @@ def build_discord_payload(
         grouped_id=message.grouped_id,
         text=message.text,
         media_files=media_files,
+        reply_to_telegram_message_id=message.reply_to_message_id,
         reply_to_discord_message_id=reply_to_discord_message_id,
         sent_at=message.sent_at,
     )

@@ -12,6 +12,7 @@ from telegram_forwarder_config import TelegramForwarderSettings
 from telegram_forwarder_discord import DiscordForwarderClient
 from telegram_forwarder_models import DiscordPayload
 from telegram_forwarder_queue import ForwarderQueue
+from telegram_forwarder_store import TelegramForwarderStore
 from telegram_forwarder_telegram import TelegramForwarderClient
 
 
@@ -23,15 +24,18 @@ class TelegramForwarderCore:
 
     def __init__(self, settings: TelegramForwarderSettings) -> None:
         self._settings = settings
+        self._store = TelegramForwarderStore(settings.sqlite_path)
+        self._store.initialize()
         self._queue = ForwarderQueue(
             max_size=settings.queue_max_size,
             album_debounce_seconds=settings.album_debounce_seconds,
         )
         self._telegram_client = TelegramForwarderClient(settings, self._queue)
-        self._discord_client = DiscordForwarderClient(settings)
+        self._discord_client = DiscordForwarderClient(settings, self._store)
         self._tasks: list[asyncio.Task[Any]] = []
         self._shutdown_event = asyncio.Event()
         self._messages_forwarded = 0
+        self._comments_forwarded = 0
         self._messages_failed = 0
         self._last_healthcheck = 0.0
 
@@ -148,6 +152,10 @@ class TelegramForwarderCore:
     async def _process_payload(self, payload: DiscordPayload) -> None:
         """Tenta enviar payload ao Discord com retry exponencial."""
 
+        if payload.is_comment and payload.telegram_channel_message_id is not None:
+            await self._process_comment(payload)
+            return
+
         enriched_payload = self._enrich_with_reply(payload)
 
         for attempt in range(self._settings.retry_max_attempts):
@@ -177,17 +185,63 @@ class TelegramForwarderCore:
         )
         self._messages_failed += 1
 
+    async def _process_comment(self, payload: DiscordPayload) -> None:
+        """Processa um comentario do Telegram como mensagem numa thread do Discord."""
+
+        if payload.telegram_channel_message_id is None:
+            logger.error("Comentario sem telegram_channel_message_id; descartando.")
+            self._messages_failed += 1
+            return
+
+        for attempt in range(self._settings.retry_max_attempts):
+            try:
+                await self._discord_client.post_comment(
+                    payload,
+                    payload.telegram_channel_message_id,
+                )
+                self._comments_forwarded += 1
+                return
+            except Exception as exc:
+                delay = min(
+                    300.0,
+                    self._settings.retry_base_delay_seconds * (2 ** attempt),
+                )
+                logger.warning(
+                    "Erro ao enviar comentario telegram_id=%s (tentativa %s/%s): %s. Retry em %.1fs.",
+                    payload.telegram_message_id,
+                    attempt + 1,
+                    self._settings.retry_max_attempts,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+        logger.error(
+            "Comentario telegram_id=%s descartado apos %s tentativas.",
+            payload.telegram_message_id,
+            self._settings.retry_max_attempts,
+        )
+        self._messages_failed += 1
+
     def _enrich_with_reply(self, payload: DiscordPayload) -> DiscordPayload:
-        """Tenta resolver o reply para uma mensagem ja enviada ao Discord."""
+        """Tenta resolver o reply para uma mensagem ja enviada ao Discord (persistente)."""
 
         if payload.reply_to_discord_message_id is not None:
             return payload
 
-        if payload.reply_to_message_id is None:
+        if payload.reply_to_telegram_message_id is None:
             return payload
 
-        discord_id = self._discord_client.get_discord_message_id(payload.reply_to_message_id)
+        discord_id = self._discord_client.resolve_discord_message_id(
+            payload.telegram_chat_id,
+            payload.reply_to_telegram_message_id,
+        )
         if discord_id is None:
+            logger.debug(
+                "Reply nao resolvido: telegram_chat_id=%s reply_to_message_id=%s",
+                payload.telegram_chat_id,
+                payload.reply_to_telegram_message_id,
+            )
             return payload
 
         return DiscordPayload(
@@ -196,8 +250,11 @@ class TelegramForwarderCore:
             grouped_id=payload.grouped_id,
             text=payload.text,
             media_files=payload.media_files,
+            reply_to_telegram_message_id=payload.reply_to_telegram_message_id,
             reply_to_discord_message_id=discord_id,
             sent_at=payload.sent_at,
+            is_comment=payload.is_comment,
+            telegram_channel_message_id=payload.telegram_channel_message_id,
         )
 
     async def _healthcheck_loop(self) -> None:
@@ -211,8 +268,9 @@ class TelegramForwarderCore:
 
             queue_size = self._queue.queue.qsize()
             logger.info(
-                "Healthcheck: forwarded=%s failed=%s queue_size=%s",
+                "Healthcheck: forwarded=%s comments=%s failed=%s queue_size=%s",
                 self._messages_forwarded,
+                self._comments_forwarded,
                 self._messages_failed,
                 queue_size,
             )
