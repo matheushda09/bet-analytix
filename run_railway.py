@@ -68,6 +68,8 @@ def resolve_service_type(
         return service_type
 
     # Inferência simples a partir das variáveis presentes.
+    if env.get("TF_DESTINY_DISCORD_USER_TOKEN") and env.get("TF_SOURCE_CHAT_ID"):
+        return "forwarder"
     if env.get("DISCORD_USER_TOKEN") or env.get("DISCORD_BOT_TOKEN"):
         return "discord"
     if env.get("TELEGRAM_API_ID") and env.get("TELEGRAM_API_HASH"):
@@ -83,6 +85,7 @@ def service_command(service_type: str) -> list[str]:
         "main": [sys.executable, "main.py"],
         "discord": [sys.executable, "discord_reaction_bot.py"],
         "userbot": [sys.executable, "userbot_listener.py"],
+        "forwarder": [sys.executable, "run_telegram_forwarder.py"],
     }
     if service_type not in mapping:
         raise RuntimeError(f"Tipo de serviço desconhecido: {service_type}")
@@ -107,6 +110,9 @@ def apply_sqlite_defaults(
     elif service_type == "userbot":
         defaults.append(("USERBOT_SQLITE_PATH", f"data/{lower_name}_userbot_signals.sqlite3"))
         defaults.append(("TELEGRAM_USERBOT_SESSION", f"data/{lower_name}_telegram_userbot.session"))
+    elif service_type == "forwarder":
+        defaults.append(("TF_TELEGRAM_SESSION_PATH", f"data/{lower_name}_telegram_forwarder.session"))
+        defaults.append(("TF_MEDIA_DOWNLOAD_DIR", f"data/{lower_name}_telegram_forwarder_media"))
 
     for var_name, default_path in defaults:
         if var_name not in overrides:
