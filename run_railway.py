@@ -142,11 +142,30 @@ def build_instance_spec(name: str, shared_env: dict[str, str]) -> InstanceSpec:
     return InstanceSpec(name=name, service_type=service_type, env=env, command=command)
 
 
+def _maybe_bootstrap_telegram_session(spec: InstanceSpec) -> None:
+    """Restaura a sessao Telethon do forwarder a partir de base64 se necessario."""
+
+    if spec.service_type != "forwarder":
+        return
+
+    try:
+        import telegram_forwarder_session_bootstrap as bootstrap
+
+        bootstrap.configure_logging()
+        session_path = Path(
+            spec.env.get("TF_TELEGRAM_SESSION_PATH", "/app/data/telegram_forwarder.session")
+        )
+        bootstrap.restore_session(session_path)
+    except Exception:
+        logger.exception("Falha no bootstrap da sessao Telethon; continuando.")
+
+
 def start_instance(spec: InstanceSpec) -> subprocess.Popen[str]:
     """Inicia o subprocesso de uma instância."""
 
     logger.info("Iniciando instância %s (%s): %s", spec.name, spec.service_type, " ".join(spec.command))
     Path("data").mkdir(parents=True, exist_ok=True)
+    _maybe_bootstrap_telegram_session(spec)
     return subprocess.Popen(
         spec.command,
         env=spec.env,
