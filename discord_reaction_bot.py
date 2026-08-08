@@ -182,14 +182,11 @@ class DiscordSignalClient(discord.Client):
                     else "nenhum"
                 ),
             )
-        await self._alert_async(
-            "DISCORD BOT ON",
-            (
-                f"guild_id={self._settings.guild_id}\n"
-                f"channel_id={self._settings.channel_id}\n"
-                f"tipster={self._settings.destination_tipster_name}"
-            ),
-            "discord_started",
+        logger.info(
+            "Discord reaction bot ON: guild_id=%s channel_id=%s tipster=%s",
+            self._settings.guild_id,
+            self._settings.channel_id,
+            self._settings.destination_tipster_name,
         )
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
