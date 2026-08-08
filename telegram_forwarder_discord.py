@@ -1,4 +1,4 @@
-"""Cliente Discord self-bot do redirecionador Telegram -> Discord."""
+"""Cliente Discord bot oficial do redirecionador Telegram -> Discord."""
 
 from __future__ import annotations
 
@@ -28,8 +28,13 @@ class DiscordForwarderClient(discord.Client):
         settings: TelegramForwarderSettings,
         store: TelegramForwarderStore,
     ) -> None:
-        # discord.py-self nao usa Intents; self-bot nao precisa deles para enviar.
-        super().__init__()
+        # Bot oficial precisa de intents explicitos para ler mensagens, reacoes e criar threads.
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.reactions = True
+        intents.guilds = True
+        intents.members = True
+        super().__init__(intents=intents)
 
         self._settings = settings
         self._store = store
@@ -44,7 +49,7 @@ class DiscordForwarderClient(discord.Client):
         """Registra quando o client esta pronto."""
 
         logger.info(
-            "Discord forwarder client ON: user_id=%s target_channel_id=%s",
+            "Discord forwarder bot ON: bot_id=%s target_channel_id=%s",
             self.user.id if self.user else None,
             self._target_channel_id,
         )

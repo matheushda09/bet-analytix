@@ -112,7 +112,7 @@ class TelegramForwarderCore:
         """Mantem o self-bot Discord conectado."""
 
         try:
-            await self._discord_client.start(self._settings.destiny_discord_user_token)
+            await self._discord_client.start(self._settings.destiny_discord_token)
         except Exception:
             logger.exception("Cliente Discord finalizou com erro fatal.")
             raise

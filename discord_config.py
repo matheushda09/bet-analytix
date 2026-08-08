@@ -65,7 +65,7 @@ def validate_discord_reaction_settings(settings: DiscordReactionSettings) -> Non
 
     missing: list[str] = []
     if not settings.bot_token and not settings.user_token:
-        missing.append("DISCORD_BOT_TOKEN ou DISCORD_USER_TOKEN")
+        missing.append("DISCORD_BOT_TOKEN")
     if settings.guild_id is None:
         missing.append("DISCORD_GUILD_ID")
     if settings.channel_id is None:

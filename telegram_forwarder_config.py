@@ -22,7 +22,7 @@ class TelegramForwarderSettings:
     source_chat_id: int
     source_comments_chat_id: int | None
     sqlite_path: Path
-    destiny_discord_user_token: str
+    destiny_discord_token: str
     destiny_discord_channel_id: int
     destiny_discord_guild_id: int | None
     log_level: str
@@ -45,7 +45,7 @@ def load_telegram_forwarder_settings(env_path: str | Path = ".env") -> TelegramF
     api_hash = _get_str("TF_TELEGRAM_API_HASH", _get_str("TELEGRAM_API_HASH", ""))
     phone = _get_str("TF_TELEGRAM_PHONE", _get_str("TELEGRAM_PHONE", ""))
     source_chat_id = _get_int("TF_SOURCE_CHAT_ID", 0)
-    discord_token = _get_str("TF_DESTINY_DISCORD_USER_TOKEN", "")
+    discord_token = _get_str("TF_DESTINY_DISCORD_BOT_TOKEN", _get_str("TF_DESTINY_DISCORD_USER_TOKEN", ""))
     discord_channel_id = _get_int("TF_DESTINY_DISCORD_CHANNEL_ID", 0)
 
     settings = TelegramForwarderSettings(
@@ -57,7 +57,7 @@ def load_telegram_forwarder_settings(env_path: str | Path = ".env") -> TelegramF
         source_chat_id=source_chat_id,
         source_comments_chat_id=_get_optional_int("TF_SOURCE_COMMENTS_CHAT_ID"),
         sqlite_path=Path(_get_str("TF_SQLITE_PATH", "data/telegram_forwarder.sqlite3")),
-        destiny_discord_user_token=discord_token,
+        destiny_discord_token=discord_token,
         destiny_discord_channel_id=discord_channel_id,
         destiny_discord_guild_id=_get_optional_int("TF_DESTINY_DISCORD_GUILD_ID"),
         log_level=_get_str("TF_LOG_LEVEL", _get_str("LOG_LEVEL", "INFO")).upper(),
@@ -89,8 +89,8 @@ def validate_telegram_forwarder_settings(settings: TelegramForwarderSettings) ->
         missing.append("TF_TELEGRAM_PHONE (ou TELEGRAM_PHONE)")
     if not settings.source_chat_id:
         missing.append("TF_SOURCE_CHAT_ID")
-    if not settings.destiny_discord_user_token:
-        missing.append("TF_DESTINY_DISCORD_USER_TOKEN")
+    if not settings.destiny_discord_token:
+        missing.append("TF_DESTINY_DISCORD_BOT_TOKEN (ou TF_DESTINY_DISCORD_USER_TOKEN legado)")
     if not settings.destiny_discord_channel_id:
         missing.append("TF_DESTINY_DISCORD_CHANNEL_ID")
 

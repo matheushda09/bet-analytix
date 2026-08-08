@@ -85,7 +85,13 @@ class DiscordSignalClient(discord.Client):
         sports_event_settings: SportsEventSettings | None = None,
         sports_event_service: SportsEventService | None = None,
     ) -> None:
-        super().__init__()
+        # Bot oficial precisa de intents explicitos.
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.reactions = True
+        intents.guilds = True
+        intents.members = True
+        super().__init__(intents=intents)
 
         self._base_settings = base_settings
         self._settings = discord_settings
@@ -156,9 +162,9 @@ class DiscordSignalClient(discord.Client):
     async def on_ready(self) -> None:
         """Registra o estado inicial do bot Discord."""
 
-        account_kind = "user" if self._settings.user_token else "bot"
+        account_kind = "bot"
         logger.info(
-            "Discord reaction client ON: account_kind=%s user_id=%s guild_id=%s channel_id=%s admin_user_id=%s tipster_destino=%s",
+            "Discord reaction client ON: account_kind=%s bot_id=%s guild_id=%s channel_id=%s admin_user_id=%s tipster_destino=%s",
             account_kind,
             self.user.id if self.user else None,
             self._settings.guild_id,
@@ -1062,7 +1068,9 @@ async def main_async(env_path: str | Path = ".env") -> None:
         sports_event_settings=sports_event_settings,
         sports_event_service=sports_event_service,
     )
-    token = discord_settings.user_token or discord_settings.bot_token
+    token = discord_settings.bot_token or discord_settings.user_token
+    if not token:
+        raise RuntimeError("DISCORD_BOT_TOKEN ou DISCORD_USER_TOKEN precisa estar configurado.")
     await client.start(str(token))
 
 

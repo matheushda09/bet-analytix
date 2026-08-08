@@ -68,9 +68,9 @@ def resolve_service_type(
         return service_type
 
     # Inferência simples a partir das variáveis presentes.
-    if env.get("TF_DESTINY_DISCORD_USER_TOKEN") and env.get("TF_SOURCE_CHAT_ID"):
+    if env.get("TF_DESTINY_DISCORD_BOT_TOKEN") and env.get("TF_SOURCE_CHAT_ID"):
         return "forwarder"
-    if env.get("DISCORD_USER_TOKEN") or env.get("DISCORD_BOT_TOKEN"):
+    if env.get("DISCORD_BOT_TOKEN") or env.get("DISCORD_USER_TOKEN"):
         return "discord"
     if env.get("TELEGRAM_API_ID") and env.get("TELEGRAM_API_HASH"):
         return "userbot"
