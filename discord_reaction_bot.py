@@ -85,12 +85,11 @@ class DiscordSignalClient(discord.Client):
         sports_event_settings: SportsEventSettings | None = None,
         sports_event_service: SportsEventService | None = None,
     ) -> None:
-        # Bot oficial precisa de intents explicitos.
+        # Bot oficial: message_content e reactions sao obrigatorios; members nao e usado.
         intents = discord.Intents.default()
         intents.message_content = True
         intents.reactions = True
         intents.guilds = True
-        intents.members = True
         super().__init__(intents=intents)
 
         self._base_settings = base_settings

@@ -28,12 +28,9 @@ class DiscordForwarderClient(discord.Client):
         settings: TelegramForwarderSettings,
         store: TelegramForwarderStore,
     ) -> None:
-        # Bot oficial precisa de intents explicitos para ler mensagens, reacoes e criar threads.
+        # Bot oficial so precisa de guilds para criar threads; nao le mensagens/reacoes/membros.
         intents = discord.Intents.default()
-        intents.message_content = True
-        intents.reactions = True
         intents.guilds = True
-        intents.members = True
         super().__init__(intents=intents)
 
         self._settings = settings

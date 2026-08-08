@@ -27,9 +27,16 @@ async def main_async(env_path: str) -> None:
 
     core = TelegramForwarderCore(settings)
 
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(core.shutdown()))
+    def _request_shutdown(signum: int, frame: object | None) -> None:
+        asyncio.create_task(core.shutdown())
+
+    # signal.signal funciona no Windows; add_signal_handler nao e suportado no ProactorEventLoop.
+    try:
+        signal.signal(signal.SIGINT, _request_shutdown)
+        signal.signal(signal.SIGTERM, _request_shutdown)
+    except ValueError:
+        # Pode falhar se nao houver loop principal (caso raro).
+        pass
 
     try:
         await core.run()

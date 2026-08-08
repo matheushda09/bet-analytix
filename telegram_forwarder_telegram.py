@@ -91,14 +91,12 @@ class TelegramForwarderClient:
         await self._client.run_until_disconnected()
 
     async def _interactive_login(self) -> None:
-        """Solicita codigo e 2FA interativamente quando a sessao nao existe."""
+        """Solicita codigo e 2FA, com fallback para variaveis de ambiente."""
 
         logger.info("Sessao nao autorizada; solicitando codigo para %s", self._settings.telegram_phone)
         await self._client.send_code_request(self._settings.telegram_phone)
 
-        code = await self._ask_input(
-            f"Digite o codigo Telegram enviado para {self._settings.telegram_phone}: "
-        )
+        code = self._env_or_input("TF_TELEGRAM_LOGIN_CODE", "Digite o codigo Telegram")
         if not code:
             raise RuntimeError("Codigo de autorizacao nao fornecido.")
 
@@ -107,7 +105,7 @@ class TelegramForwarderClient:
         except Exception as first_exc:
             error_text = str(first_exc)
             if "2FA" in error_text or "password" in error_text.lower():
-                password = await self._ask_input("Conta com 2FA. Digite a senha: ")
+                password = self._env_or_input("TF_TELEGRAM_2FA_PASSWORD", "Conta com 2FA. Digite a senha")
                 if not password:
                     raise RuntimeError("Senha 2FA nao fornecida.") from first_exc
                 await self._client.sign_in(password=password)
@@ -115,15 +113,19 @@ class TelegramForwarderClient:
                 raise
         logger.info("Sessao Telegram autorizada e salva em %s.", self._settings.telegram_session_path)
 
-    async def _ask_input(self, prompt: str) -> str:
-        """Le input do terminal sem bloquear o event loop do asyncio."""
+    def _env_or_input(self, env_name: str, prompt: str) -> str | None:
+        """Tenta ler de variavel de ambiente; se nao houver, pede no terminal."""
 
+        value = os.getenv(env_name, "").strip()
+        if value:
+            logger.info("Usando valor da variavel de ambiente %s.", env_name)
+            return value
         try:
-            return (await asyncio.to_thread(input, prompt)).strip()
+            return input(f"{prompt}: ").strip()
         except EOFError:
             raise RuntimeError(
-                "Entrada interativa indisponivel. "
-                "Autorize a sessao localmente em um terminal real."
+                f"Entrada interativa indisponivel. Defina {env_name} no ambiente "
+                "ou autorize a sessao localmente em um terminal real."
             )
 
     async def stop(self) -> None:
