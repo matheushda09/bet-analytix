@@ -193,7 +193,7 @@ class TelegramForwarderClient:
     async def _handle_comment_message(self, message) -> None:
         """Processa um comentario do grupo de discussao vinculado."""
 
-        channel_message_id = self._resolve_comment_target(message)
+        channel_message_id = await self._resolve_comment_target(message)
         if channel_message_id is None:
             logger.debug(
                 "Comentario ignorado pois nao conseguiu identificar mensagem do canal: message_id=%s",
@@ -219,14 +219,47 @@ class TelegramForwarderClient:
         object.__setattr__(payload, "telegram_channel_message_id", channel_message_id)
         await self._queue.enqueue(payload)
 
-    def _resolve_comment_target(self, message) -> int | None:
-        """Tenta extrair o ID da mensagem do canal original a partir de um comentario."""
+    async def _resolve_comment_target(self, message) -> int | None:
+        """Tenta extrair o ID da mensagem do canal original a partir de um comentario.
+
+        Em grupos de discussao vinculados a canais, o reply_to_msg_id de um comentario
+        aponta para uma mensagem 'fantasma' no proprio grupo, que e o espelho da postagem
+        do canal. Essa mensagem fantasma contem fwd_from.channel_post com o ID original
+        da mensagem no canal. Usamos esse ID para buscar o mapeamento correto no banco.
+        """
 
         reply_to = getattr(message, "reply_to", None)
         if reply_to is None:
             return None
 
-        # Comentarios no Telegram referenciam a mensagem do canal via reply_to_msg_id.
+        # Primeira tentativa: resolver via mensagem reply para obter o ID original do canal.
+        try:
+            reply_message = await message.get_reply_message()
+        except Exception as exc:
+            logger.debug(
+                "Nao foi possivel carregar mensagem reply para message_id=%s: %s",
+                message.id,
+                exc,
+            )
+            reply_message = None
+
+        if reply_message is not None:
+            fwd_from = getattr(reply_message, "fwd_from", None)
+            if fwd_from is not None:
+                channel_post = getattr(fwd_from, "channel_post", None)
+                if channel_post is not None:
+                    try:
+                        original_id = int(channel_post)
+                        logger.debug(
+                            "Comentario message_id=%s resolvido para ID original do canal: %s",
+                            message.id,
+                            original_id,
+                        )
+                        return original_id
+                    except (TypeError, ValueError):
+                        pass
+
+        # Fallback: reply_to_msg_id / reply_to_top_id locais do grupo de discussao.
         for attr in ("reply_to_msg_id", "reply_to_top_id"):
             value = getattr(reply_to, attr, None)
             if value is not None:
@@ -235,7 +268,7 @@ class TelegramForwarderClient:
                 except (TypeError, ValueError):
                     continue
 
-        # Fallback: reply_to pode ter um atributo message_id direto em algumas versoes.
+        # Fallback final: reply_to pode ter um atributo message_id direto em algumas versoes.
         message_id = getattr(reply_to, "message_id", None)
         if message_id is not None:
             try:

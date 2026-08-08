@@ -199,8 +199,8 @@ class TelegramForwarderCore:
             payload.telegram_channel_message_id,
         )
         if parent_discord_id is None:
-            logger.debug(
-                "Comentario telegram_id=%s descartado: mensagem principal %s ainda nao encaminhada.",
+            logger.info(
+                "Comentario telegram_id=%s descartado: mensagem principal %s nao possui mapeamento no Discord (ainda nao encaminhada ou ID nao resolvido).",
                 payload.telegram_message_id,
                 payload.telegram_channel_message_id,
             )
