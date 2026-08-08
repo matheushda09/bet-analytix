@@ -193,6 +193,20 @@ class TelegramForwarderCore:
             self._messages_failed += 1
             return
 
+        # Se a mensagem principal ainda nao foi encaminhada, descarta para nao bloquear a fila.
+        parent_discord_id = self._store.get_discord_message_id(
+            self._settings.source_chat_id,
+            payload.telegram_channel_message_id,
+        )
+        if parent_discord_id is None:
+            logger.debug(
+                "Comentario telegram_id=%s descartado: mensagem principal %s ainda nao encaminhada.",
+                payload.telegram_message_id,
+                payload.telegram_channel_message_id,
+            )
+            self._messages_failed += 1
+            return
+
         for attempt in range(self._settings.retry_max_attempts):
             try:
                 await self._discord_client.post_comment(

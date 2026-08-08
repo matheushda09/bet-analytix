@@ -162,7 +162,10 @@ class TelegramForwarderClient:
             if chat_id == self._settings.source_chat_id:
                 await self._handle_channel_message(message)
             elif chat_id == self._settings.source_comments_chat_id:
-                await self._handle_comment_message(message)
+                if self._settings.forward_comments:
+                    await self._handle_comment_message(message)
+                else:
+                    logger.debug("Comentarios desabilitados; ignorando message_id=%s", message.id)
             else:
                 logger.debug("Mensagem ignorada de chat nao monitorado: chat_id=%s", chat_id)
         except Exception:
