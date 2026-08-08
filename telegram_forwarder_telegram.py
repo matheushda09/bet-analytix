@@ -19,7 +19,7 @@ from telethon.tl.types import (
 )
 
 from telegram_forwarder_config import TelegramForwarderSettings
-from telegram_forwarder_models import TelegramMedia, TelegramMessage
+from telegram_forwarder_models import TelegramMedia, TelegramMessage, build_discord_payload, DiscordPayload
 from telegram_forwarder_queue import ForwarderQueue
 
 
