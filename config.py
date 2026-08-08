@@ -85,7 +85,11 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
     load_dotenv(env_path)
 
     telegram_bot_token = _get_str("TELEGRAM_BOT_TOKEN", "")
+    telegram_admin_user_ids = _get_admin_user_ids()
     telegram_chat_id = _get_str("TELEGRAM_CHAT_ID", "")
+    # Fallback para o primeiro admin se TELEGRAM_CHAT_ID nao estiver definido.
+    if not telegram_chat_id and telegram_admin_user_ids:
+        telegram_chat_id = str(telegram_admin_user_ids[0])
 
     target_tipster_names = _get_list("TARGET_TIPSTER_NAMES")
     if not target_tipster_names:
@@ -121,8 +125,8 @@ def load_settings(env_path: str | Path = ".env") -> Settings:
         sport_names=_load_sport_names(),
         bookmaker_names=_load_string_map("BOOKMAKER_NAMES_JSON"),
         copytrade_enabled=_get_bool("COPYTRADE_ENABLED", False),
-        telegram_admin_user_id=_first_admin_user_id(),
-        telegram_admin_user_ids=_get_admin_user_ids(),
+        telegram_admin_user_id=telegram_admin_user_ids[0] if telegram_admin_user_ids else None,
+        telegram_admin_user_ids=telegram_admin_user_ids,
         telegram_reaction_poll_timeout_seconds=_get_int("TELEGRAM_REACTION_POLL_TIMEOUT_SECONDS", 25),
         copytrade_queue_batch_size=_get_int("COPYTRADE_QUEUE_BATCH_SIZE", 5),
         copytrade_retry_max_seconds=_get_int("COPYTRADE_RETRY_MAX_SECONDS", 900),
