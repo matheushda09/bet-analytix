@@ -77,11 +77,12 @@ class TelegramReactionListener:
                 )
             except requests.exceptions.HTTPError as exc:
                 status_code = exc.response.status_code if exc.response is not None else None
-                if status_code in {429, 500, 502, 503, 504}:
+                # 409 = outra instancia usando o mesmo token; pode acontecer em restart rapido.
+                if status_code in {409, 429, 500, 502, 503, 504}:
                     self._handle_transient_poll_error(
                         exc,
                         label=f"HTTP {status_code} temporario no getUpdates",
-                        alert_after=3,
+                        alert_after=6,
                         sleep_cap_seconds=60,
                     )
                 else:
