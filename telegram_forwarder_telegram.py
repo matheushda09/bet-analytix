@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.tl.types import (
     MessageMediaDocument,
     MessageMediaPhoto,
@@ -37,14 +38,20 @@ class TelegramForwarderClient:
         self._settings = settings
         self._queue = queue
 
-        # Garante que os diretorios existem antes de instanciar o TelegramClient,
-        # pois o arquivo .session e um banco SQLite e precisa de pasta valida.
-        settings.telegram_session_path.parent.mkdir(parents=True, exist_ok=True)
+        # Usa StringSession se definido em variavel de ambiente; caso contrario, arquivo SQLite.
         self._media_dir = settings.media_download_dir
         self._media_dir.mkdir(parents=True, exist_ok=True)
 
+        if settings.telegram_session_string:
+            session = StringSession(settings.telegram_session_string)
+            logger.info("Usando StringSession da variavel TF_TELEGRAM_SESSION_STRING.")
+        else:
+            settings.telegram_session_path.parent.mkdir(parents=True, exist_ok=True)
+            session = str(settings.telegram_session_path)
+            logger.info("Usando arquivo de sessao: %s", settings.telegram_session_path)
+
         self._client = TelegramClient(
-            str(settings.telegram_session_path),
+            session,
             settings.telegram_api_id,
             settings.telegram_api_hash,
             # System version neutro para nao chamar atencao.

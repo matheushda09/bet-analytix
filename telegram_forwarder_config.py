@@ -18,6 +18,7 @@ class TelegramForwarderSettings:
     telegram_api_id: int
     telegram_api_hash: str
     telegram_phone: str
+    telegram_session_string: str | None
     telegram_session_path: Path
     source_chat_id: int
     source_comments_chat_id: int | None
@@ -53,6 +54,7 @@ def load_telegram_forwarder_settings(env_path: str | Path = ".env") -> TelegramF
         telegram_api_id=api_id,
         telegram_api_hash=api_hash,
         telegram_phone=phone,
+        telegram_session_string=_get_optional_str("TF_TELEGRAM_SESSION_STRING"),
         telegram_session_path=Path(_get_str("TF_TELEGRAM_SESSION_PATH", "data/telegram_forwarder.session")),
         source_chat_id=source_chat_id,
         source_comments_chat_id=_get_optional_int("TF_SOURCE_COMMENTS_CHAT_ID"),

@@ -5,3 +5,18 @@ data/
 *.log
 __pycache__/
 *.py[cod]
+# Variáveis de ambiente e sessões
+.env
+.env.*
+*.session
+*.session-journal
+
+# Dados locais
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
