@@ -39,6 +39,7 @@ class TelegramForwarderSettings:
     forward_comments: bool
     forward_edits: bool
     max_edit_age_hours: int
+    suppress_link_previews: bool
 
 
 def load_telegram_forwarder_settings(env_path: str | Path = ".env") -> TelegramForwarderSettings:
@@ -79,6 +80,7 @@ def load_telegram_forwarder_settings(env_path: str | Path = ".env") -> TelegramF
         forward_comments=_get_bool("TF_FORWARD_COMMENTS", True),
         forward_edits=_get_bool("TF_FORWARD_EDITS", True),
         max_edit_age_hours=_get_int("TF_MAX_EDIT_AGE_HOURS", 12),
+        suppress_link_previews=_get_bool("TF_SUPPRESS_LINK_PREVIEWS", True),
     )
 
     if settings.enabled:

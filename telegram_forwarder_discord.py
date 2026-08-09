@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,12 @@ logger = logging.getLogger(__name__)
 
 MAX_FILES_PER_MESSAGE = 10
 MAX_TEXT_LENGTH = 2000
+
+# Regex simples para detectar URLs http/https.
+_URL_RE = re.compile(
+    r"https?://[^\s<>\"\')\]\}]+",
+    re.IGNORECASE,
+)
 
 
 class DiscordForwarderClient(discord.Client):
@@ -72,7 +79,7 @@ class DiscordForwarderClient(discord.Client):
         await self._throttle()
 
         reference = self._build_reference(payload.reply_to_discord_message_id)
-        text = self._sanitize_text(payload.text)
+        text = self._prepare_text(payload.text)
 
         try:
             discord_message = await self._send_to_channel(
@@ -179,7 +186,7 @@ class DiscordForwarderClient(discord.Client):
         if not isinstance(thread, discord.Thread):
             raise RuntimeError(f"Canal retornado nao e uma thread: {type(thread).__name__}")
 
-        text = self._sanitize_text(payload.text)
+        text = self._prepare_text(payload.text)
         await self._send_to_channel(
             channel=thread,
             text=text,
@@ -368,6 +375,31 @@ class DiscordForwarderClient(discord.Client):
             return text
         return text[: MAX_TEXT_LENGTH - 3] + "..."
 
+    def _prepare_text(self, text: str) -> str:
+        """Aplica supressao de link previews e truncamento."""
+
+        if self._settings.suppress_link_previews:
+            text = self._suppress_link_previews(text)
+        return self._sanitize_text(text)
+
+    @staticmethod
+    def _suppress_link_previews(text: str) -> str:
+        """Envolve URLs em <> para evitar embeds/previews no Discord."""
+
+        if not text:
+            return text
+
+        def _wrap(match: re.Match[str]) -> str:
+            url = match.group(0)
+            if url.startswith("<") and url.endswith(">"):
+                return url
+            if url.startswith("[") or url.endswith(")"):
+                # Markdown link ja formatado; nao altera.
+                return url
+            return f"<{url}>"
+
+        return _URL_RE.sub(_wrap, text)
+
     @staticmethod
     def _thread_name_from_text(text: str) -> str:
         """Gera um nome curto para a thread baseado no texto."""
@@ -401,7 +433,7 @@ class DiscordForwarderClient(discord.Client):
             )
             return
 
-        text = self._sanitize_text(new_text)
+        text = self._prepare_text(new_text)
         await discord_message.edit(content=text)
         logger.info(
             "Mensagem editada no Discord: telegram_id=%s discord_id=%s",
