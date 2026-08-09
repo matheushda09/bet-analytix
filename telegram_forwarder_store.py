@@ -46,6 +46,15 @@ class TelegramForwarderStore:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS telegram_discord_comment_map (
+                    telegram_chat_id INTEGER NOT NULL,
+                    telegram_message_id INTEGER NOT NULL,
+                    discord_thread_id INTEGER NOT NULL,
+                    discord_message_id INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (telegram_chat_id, telegram_message_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_message_map_chat
                     ON telegram_discord_message_map(telegram_chat_id, telegram_message_id);
                 """
@@ -128,3 +137,63 @@ class TelegramForwarderStore:
                 (telegram_channel_message_id,),
             ).fetchone()
             return int(row["discord_thread_id"]) if row else None
+
+    def get_channel_message_id_for_thread(
+        self,
+        discord_thread_id: int,
+    ) -> int | None:
+        """Recupera o telegram_channel_message_id a partir do discord_thread_id."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT telegram_channel_message_id
+                FROM telegram_discord_thread_map
+                WHERE discord_thread_id = ?
+                """,
+                (discord_thread_id,),
+            ).fetchone()
+            return int(row["telegram_channel_message_id"]) if row else None
+
+    def save_comment_mapping(
+        self,
+        telegram_chat_id: int,
+        telegram_message_id: int,
+        discord_thread_id: int,
+        discord_message_id: int,
+    ) -> None:
+        """Persiste o mapeamento de um comentario Telegram -> mensagem Discord na thread."""
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO telegram_discord_comment_map
+                    (telegram_chat_id, telegram_message_id, discord_thread_id, discord_message_id)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(telegram_chat_id, telegram_message_id)
+                DO UPDATE SET discord_thread_id=excluded.discord_thread_id,
+                              discord_message_id=excluded.discord_message_id
+                """,
+                (telegram_chat_id, telegram_message_id, discord_thread_id, discord_message_id),
+            )
+            conn.commit()
+
+    def get_discord_comment_message_id(
+        self,
+        telegram_chat_id: int,
+        telegram_message_id: int,
+    ) -> tuple[int, int] | None:
+        """Recupera (discord_thread_id, discord_message_id) de um comentario Telegram."""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT discord_thread_id, discord_message_id
+                FROM telegram_discord_comment_map
+                WHERE telegram_chat_id = ? AND telegram_message_id = ?
+                """,
+                (telegram_chat_id, telegram_message_id),
+            ).fetchone()
+            if row is None:
+                return None
+            return int(row["discord_thread_id"]), int(row["discord_message_id"])

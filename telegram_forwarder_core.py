@@ -46,6 +46,7 @@ class TelegramForwarderCore:
             self._message_queue,
             self._comment_queue,
             self._discord_client,
+            self._store,
         )
         self._tasks: list[asyncio.Task[Any]] = []
         self._shutdown_event = asyncio.Event()
@@ -259,6 +260,7 @@ class TelegramForwarderCore:
                 await self._discord_client.post_comment(
                     payload,
                     payload.telegram_channel_message_id,
+                    reply_to_discord_message_id=payload.reply_to_discord_message_id,
                 )
                 async with self._stats_lock:
                     self._comments_forwarded += 1

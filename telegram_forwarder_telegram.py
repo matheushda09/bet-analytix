@@ -22,6 +22,7 @@ from telethon.tl.types import (
 from telegram_forwarder_config import TelegramForwarderSettings
 from telegram_forwarder_models import TelegramMedia, TelegramMessage, build_discord_payload, DiscordPayload
 from telegram_forwarder_queue import ForwarderQueue
+from telegram_forwarder_store import TelegramForwarderStore
 
 
 logger = logging.getLogger(__name__)
@@ -36,11 +37,13 @@ class TelegramForwarderClient:
         message_queue: ForwarderQueue,
         comment_queue: asyncio.Queue[DiscordPayload],
         discord_client: Any,
+        store: TelegramForwarderStore,
     ) -> None:
         self._settings = settings
         self._message_queue = message_queue
         self._comment_queue = comment_queue
         self._discord_client = discord_client
+        self._store = store
 
         # Usa StringSession se definido em variavel de ambiente; caso contrario, arquivo SQLite.
         self._media_dir = settings.media_download_dir
@@ -278,7 +281,7 @@ class TelegramForwarderClient:
     async def _handle_comment_message(self, message) -> None:
         """Processa um comentario do grupo de discussao vinculado."""
 
-        channel_message_id = await self._resolve_comment_target(message)
+        channel_message_id, comment_reply_to_discord_id = await self._resolve_comment_target(message)
         if channel_message_id is None:
             logger.debug(
                 "Comentario ignorado pois nao conseguiu identificar mensagem do canal: message_id=%s",
@@ -291,10 +294,11 @@ class TelegramForwarderClient:
             return
 
         logger.info(
-            "Comentario Telegram capturado: message_id=%s chat_id=%s target_channel_message_id=%s sender=%s",
+            "Comentario Telegram capturado: message_id=%s chat_id=%s target_channel_message_id=%s reply_to_discord=%s sender=%s",
             tg_message.telegram_message_id,
             tg_message.telegram_chat_id,
             channel_message_id,
+            comment_reply_to_discord_id,
             tg_message.sender_name,
         )
 
@@ -302,10 +306,17 @@ class TelegramForwarderClient:
         payload = build_discord_payload(tg_message, media_files)
         object.__setattr__(payload, "is_comment", True)
         object.__setattr__(payload, "telegram_channel_message_id", channel_message_id)
+        if comment_reply_to_discord_id is not None:
+            object.__setattr__(payload, "reply_to_discord_message_id", comment_reply_to_discord_id)
         await self._comment_queue.put(payload)
 
-    async def _resolve_comment_target(self, message) -> int | None:
-        """Tenta extrair o ID da mensagem do canal original a partir de um comentario.
+    async def _resolve_comment_target(self, message) -> tuple[int | None, int | None]:
+        """Resolve a qual sinal o comentario pertence e se e reply a outro comentario.
+
+        Retorna (channel_message_id, comment_reply_to_discord_id):
+        - channel_message_id: ID da mensagem original no canal principal (para a thread).
+        - comment_reply_to_discord_id: ID da mensagem Discord a ser usada como reference,
+          quando o comentario e resposta a outro comentario ja enviado ao Discord.
 
         Em grupos de discussao vinculados a canais, o reply_to_msg_id de um comentario
         aponta para uma mensagem 'fantasma' no proprio grupo, que e o espelho da postagem
@@ -315,7 +326,7 @@ class TelegramForwarderClient:
 
         reply_to = getattr(message, "reply_to", None)
         if reply_to is None:
-            return None
+            return None, None
 
         # Primeira tentativa: resolver via mensagem reply para obter o ID original do canal.
         try:
@@ -340,16 +351,33 @@ class TelegramForwarderClient:
                             message.id,
                             original_id,
                         )
-                        return original_id
+                        return original_id, None
                     except (TypeError, ValueError):
                         pass
+
+            # O reply pode ser a outro comentario ja enviado ao Discord.
+            reply_chat_id = int(reply_message.chat_id) if reply_message.chat_id else int(message.chat_id)
+            reply_message_id = int(reply_message.id)
+            mapping = self._store.get_discord_comment_message_id(reply_chat_id, reply_message_id)
+            if mapping is not None:
+                thread_id, discord_message_id = mapping
+                # Recupera o sinal original associado a essa thread.
+                channel_message_id = self._store.get_channel_message_id_for_thread(thread_id)
+                if channel_message_id is not None:
+                    logger.debug(
+                        "Comentario message_id=%s resolvido como reply a comentario %s na thread %s",
+                        message.id,
+                        discord_message_id,
+                        thread_id,
+                    )
+                    return channel_message_id, discord_message_id
 
         # Fallback: reply_to_msg_id / reply_to_top_id locais do grupo de discussao.
         for attr in ("reply_to_msg_id", "reply_to_top_id"):
             value = getattr(reply_to, attr, None)
             if value is not None:
                 try:
-                    return int(value)
+                    return int(value), None
                 except (TypeError, ValueError):
                     continue
 
@@ -357,11 +385,11 @@ class TelegramForwarderClient:
         message_id = getattr(reply_to, "message_id", None)
         if message_id is not None:
             try:
-                return int(message_id)
+                return int(message_id), None
             except (TypeError, ValueError):
                 pass
 
-        return None
+        return None, None
 
     async def _extract_message(
         self,

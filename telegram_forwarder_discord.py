@@ -131,6 +131,7 @@ class DiscordForwarderClient(discord.Client):
         self,
         payload: DiscordPayload,
         telegram_channel_message_id: int,
+        reply_to_discord_message_id: int | None = None,
     ) -> None:
         """Envia um comentario do Telegram como mensagem numa thread do Discord."""
 
@@ -187,17 +188,36 @@ class DiscordForwarderClient(discord.Client):
             raise RuntimeError(f"Canal retornado nao e uma thread: {type(thread).__name__}")
 
         text = self._prepare_text(payload.text)
-        await self._send_to_channel(
+        reference = None
+        if reply_to_discord_message_id is not None:
+            try:
+                reference = discord.MessageReference(
+                    message_id=reply_to_discord_message_id,
+                    channel_id=thread.id,
+                    guild_id=self._guild_id,
+                )
+            except Exception:
+                logger.exception("Falha ao montar message reference para comentario; prosseguindo sem reply.")
+
+        discord_message = await self._send_to_channel(
             channel=thread,
             text=text,
             files=payload.media_files,
-            reference=None,
+            reference=reference,
             payload=payload,
         )
         logger.info(
-            "Comentario enviado para thread: telegram_message_id=%s discord_thread_id=%s",
+            "Comentario enviado para thread: telegram_message_id=%s discord_thread_id=%s discord_message_id=%s",
             payload.telegram_message_id,
             thread.id,
+            discord_message.id,
+        )
+
+        self._store.save_comment_mapping(
+            payload.telegram_chat_id,
+            payload.telegram_message_id,
+            thread.id,
+            discord_message.id,
         )
 
         self._last_send_time = asyncio.get_event_loop().time()
