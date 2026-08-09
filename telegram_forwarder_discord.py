@@ -37,8 +37,14 @@ class DiscordForwarderClient(discord.Client):
         self._store = store
         self._target_channel_id = settings.destiny_discord_channel_id
         self._guild_id = settings.destiny_discord_guild_id
-        self._rate_limit_interval = 1.0 / max(0.01, settings.rate_limit_messages_per_second)
-        self._last_send_time: float = 0.0
+
+        # Token bucket para rate-limit: permite bursts e depois steady rate.
+        self._rate_limit_per_second = max(0.01, settings.rate_limit_messages_per_second)
+        self._rate_limit_bucket_capacity = max(1, settings.rate_limit_burst_size)
+        self._rate_limit_tokens: float = float(self._rate_limit_bucket_capacity)
+        self._rate_limit_last_replenish: float = asyncio.get_event_loop().time()
+        self._rate_limit_lock = asyncio.Lock()
+
         self._ready_event = asyncio.Event()
         self._shutdown = False
 
@@ -201,10 +207,24 @@ class DiscordForwarderClient(discord.Client):
         return channel
 
     async def _throttle(self) -> None:
-        now = asyncio.get_event_loop().time()
-        elapsed = now - self._last_send_time
-        if elapsed < self._rate_limit_interval:
-            await asyncio.sleep(self._rate_limit_interval - elapsed)
+        """Aguarda ate haver token disponivel no bucket (rate-limit global)."""
+
+        async with self._rate_limit_lock:
+            now = asyncio.get_event_loop().time()
+            elapsed = now - self._rate_limit_last_replenish
+            self._rate_limit_last_replenish = now
+            self._rate_limit_tokens = min(
+                self._rate_limit_bucket_capacity,
+                self._rate_limit_tokens + elapsed * self._rate_limit_per_second,
+            )
+
+            if self._rate_limit_tokens < 1.0:
+                wait_seconds = (1.0 - self._rate_limit_tokens) / self._rate_limit_per_second
+                logger.debug("Rate-limit: aguardando %.3fs antes do proximo envio.", wait_seconds)
+                await asyncio.sleep(wait_seconds)
+                self._rate_limit_tokens = 0.0
+            else:
+                self._rate_limit_tokens -= 1.0
 
     def _build_reference(self, discord_message_id: int | None) -> discord.MessageReference | None:
         if discord_message_id is None:

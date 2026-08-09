@@ -18,40 +18,56 @@ from telegram_forwarder_telegram import TelegramForwarderClient
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MESSAGE_WORKERS = 2
+DEFAULT_COMMENT_WORKERS = 3
+
 
 class TelegramForwarderCore:
-    """OrquestraTelegram -> fila -> Discord com retry e healthcheck."""
+    """Orquestra Telegram -> filas -> Discord com retry, workers paralelos e healthcheck."""
 
     def __init__(self, settings: TelegramForwarderSettings) -> None:
         self._settings = settings
         self._store = TelegramForwarderStore(settings.sqlite_path)
         self._store.initialize()
-        self._queue = ForwarderQueue(
+
+        # Fila separada para mensagens principais (com debounce de albuns).
+        self._message_queue = ForwarderQueue(
             max_size=settings.queue_max_size,
             album_debounce_seconds=settings.album_debounce_seconds,
         )
-        self._telegram_client = TelegramForwarderClient(settings, self._queue)
+        # Fila separada para comentarios, evitando que criacao de thread bloqueie sinais.
+        self._comment_queue: asyncio.Queue[DiscordPayload] = asyncio.Queue(
+            maxsize=settings.queue_max_size,
+        )
+
+        self._telegram_client = TelegramForwarderClient(
+            settings,
+            self._message_queue,
+            self._comment_queue,
+        )
         self._discord_client = DiscordForwarderClient(settings, self._store)
         self._tasks: list[asyncio.Task[Any]] = []
         self._shutdown_event = asyncio.Event()
         self._messages_forwarded = 0
         self._comments_forwarded = 0
         self._messages_failed = 0
+        self._comments_failed = 0
         self._last_healthcheck = 0.0
+        self._stats_lock = asyncio.Lock()
 
     async def run(self) -> None:
         """Inicia todos os componentes e aguarda interrupcao."""
 
         logger.info("Iniciando redirecionador Telegram -> Discord.")
 
-        # Tarefa do cliente Discord (self-bot).
+        # Tarefa do cliente Discord (bot oficial).
         discord_task = asyncio.create_task(
             self._run_discord_client(),
             name="discord-forwarder-client",
         )
         self._tasks.append(discord_task)
 
-        # Espera o Discord estar pronto antes de iniciar o consumidor.
+        # Espera o Discord estar pronto antes de iniciar os consumidores.
         try:
             await asyncio.wait_for(self._discord_client.wait_until_ready(), timeout=120)
         except asyncio.TimeoutError:
@@ -59,12 +75,20 @@ class TelegramForwarderCore:
             await self.shutdown()
             return
 
-        # Tarefa consumidora da fila.
-        consumer_task = asyncio.create_task(
-            self._consume_loop(),
-            name="discord-consumer",
-        )
-        self._tasks.append(consumer_task)
+        # Workers paralelos para mensagens principais e comentarios.
+        for i in range(DEFAULT_MESSAGE_WORKERS):
+            task = asyncio.create_task(
+                self._consume_message_loop(),
+                name=f"discord-message-worker-{i}",
+            )
+            self._tasks.append(task)
+
+        for i in range(DEFAULT_COMMENT_WORKERS):
+            task = asyncio.create_task(
+                self._consume_comment_loop(),
+                name=f"discord-comment-worker-{i}",
+            )
+            self._tasks.append(task)
 
         # Tarefa de healthcheck.
         health_task = asyncio.create_task(
@@ -97,7 +121,7 @@ class TelegramForwarderCore:
 
         await self._telegram_client.stop()
         await self._discord_client.close()
-        await self._queue.close()
+        await self._message_queue.close()
 
         for task in self._tasks:
             if not task.done():
@@ -109,7 +133,7 @@ class TelegramForwarderCore:
         logger.info("Redirecionador encerrado.")
 
     async def _run_discord_client(self) -> None:
-        """Mantem o self-bot Discord conectado."""
+        """Mantem o bot Discord conectado."""
 
         try:
             await self._discord_client.start(self._settings.destiny_discord_token)
@@ -129,13 +153,13 @@ class TelegramForwarderCore:
             # Se o client Telegram parar, inicia shutdown geral.
             self._shutdown_event.set()
 
-    async def _consume_loop(self) -> None:
-        """Consome payloads da fila e envia ao Discord com retry."""
+    async def _consume_message_loop(self) -> None:
+        """Consome payloads da fila de mensagens e envia ao Discord com retry."""
 
         while not self._shutdown_event.is_set():
             try:
                 payload = await asyncio.wait_for(
-                    self._queue.get_payload(),
+                    self._message_queue.get_payload(),
                     timeout=1.0,
                 )
             except asyncio.TimeoutError:
@@ -145,23 +169,42 @@ class TelegramForwarderCore:
                 await self._process_payload(payload)
             except Exception:
                 logger.exception("Falha critica ao processar payload %s; descartando.", payload.telegram_message_id)
-                self._messages_failed += 1
+                async with self._stats_lock:
+                    self._messages_failed += 1
             finally:
-                self._queue.task_done()
+                self._message_queue.task_done()
+
+    async def _consume_comment_loop(self) -> None:
+        """Consome comentarios da fila dedicada e envia como threads."""
+
+        while not self._shutdown_event.is_set():
+            try:
+                payload = await asyncio.wait_for(
+                    self._comment_queue.get(),
+                    timeout=1.0,
+                )
+            except asyncio.TimeoutError:
+                continue
+
+            try:
+                await self._process_comment(payload)
+            except Exception:
+                logger.exception("Falha critica ao processar comentario %s; descartando.", payload.telegram_message_id)
+                async with self._stats_lock:
+                    self._comments_failed += 1
+            finally:
+                self._comment_queue.task_done()
 
     async def _process_payload(self, payload: DiscordPayload) -> None:
         """Tenta enviar payload ao Discord com retry exponencial."""
-
-        if payload.is_comment and payload.telegram_channel_message_id is not None:
-            await self._process_comment(payload)
-            return
 
         enriched_payload = self._enrich_with_reply(payload)
 
         for attempt in range(self._settings.retry_max_attempts):
             try:
                 await self._discord_client.post_payload(enriched_payload)
-                self._messages_forwarded += 1
+                async with self._stats_lock:
+                    self._messages_forwarded += 1
                 return
             except Exception as exc:
                 delay = min(
@@ -183,14 +226,16 @@ class TelegramForwarderCore:
             payload.telegram_message_id,
             self._settings.retry_max_attempts,
         )
-        self._messages_failed += 1
+        async with self._stats_lock:
+            self._messages_failed += 1
 
     async def _process_comment(self, payload: DiscordPayload) -> None:
         """Processa um comentario do Telegram como mensagem numa thread do Discord."""
 
         if payload.telegram_channel_message_id is None:
             logger.error("Comentario sem telegram_channel_message_id; descartando.")
-            self._messages_failed += 1
+            async with self._stats_lock:
+                self._comments_failed += 1
             return
 
         # Se a mensagem principal ainda nao foi encaminhada, descarta para nao bloquear a fila.
@@ -200,11 +245,12 @@ class TelegramForwarderCore:
         )
         if parent_discord_id is None:
             logger.info(
-                "Comentario telegram_id=%s descartado: mensagem principal %s nao possui mapeamento no Discord (ainda nao encaminhada ou ID nao resolvido).",
+                "Comentario telegram_id=%s descartado: mensagem principal %s nao possui mapeamento no Discord.",
                 payload.telegram_message_id,
                 payload.telegram_channel_message_id,
             )
-            self._messages_failed += 1
+            async with self._stats_lock:
+                self._comments_failed += 1
             return
 
         for attempt in range(self._settings.retry_max_attempts):
@@ -213,7 +259,8 @@ class TelegramForwarderCore:
                     payload,
                     payload.telegram_channel_message_id,
                 )
-                self._comments_forwarded += 1
+                async with self._stats_lock:
+                    self._comments_forwarded += 1
                 return
             except Exception as exc:
                 delay = min(
@@ -235,7 +282,8 @@ class TelegramForwarderCore:
             payload.telegram_message_id,
             self._settings.retry_max_attempts,
         )
-        self._messages_failed += 1
+        async with self._stats_lock:
+            self._comments_failed += 1
 
     def _enrich_with_reply(self, payload: DiscordPayload) -> DiscordPayload:
         """Tenta resolver o reply para uma mensagem ja enviada ao Discord (persistente)."""
@@ -280,13 +328,20 @@ class TelegramForwarderCore:
             except asyncio.CancelledError:
                 return
 
-            queue_size = self._queue.queue.qsize()
+            async with self._stats_lock:
+                forwarded = self._messages_forwarded
+                comments = self._comments_forwarded
+                failed_messages = self._messages_failed
+                failed_comments = self._comments_failed
+
             logger.info(
-                "Healthcheck: forwarded=%s comments=%s failed=%s queue_size=%s",
-                self._messages_forwarded,
-                self._comments_forwarded,
-                self._messages_failed,
-                queue_size,
+                "Healthcheck: forwarded=%s comments=%s failed_messages=%s failed_comments=%s message_queue=%s comment_queue=%s",
+                forwarded,
+                comments,
+                failed_messages,
+                failed_comments,
+                self._message_queue.queue.qsize(),
+                self._comment_queue.qsize(),
             )
             self._last_healthcheck = time.monotonic()
 

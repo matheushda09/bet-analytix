@@ -31,6 +31,7 @@ class TelegramForwarderSettings:
     media_download_dir: Path
     album_debounce_seconds: float
     rate_limit_messages_per_second: float
+    rate_limit_burst_size: int
     healthcheck_interval_seconds: int
     retry_max_attempts: int
     retry_base_delay_seconds: float
@@ -66,8 +67,9 @@ def load_telegram_forwarder_settings(env_path: str | Path = ".env") -> TelegramF
         log_level=_get_str("TF_LOG_LEVEL", _get_str("LOG_LEVEL", "INFO")).upper(),
         queue_max_size=_get_int("TF_QUEUE_MAX_SIZE", 1000),
         media_download_dir=Path(_get_str("TF_MEDIA_DOWNLOAD_DIR", "data/telegram_forwarder_media")),
-        album_debounce_seconds=_get_float("TF_ALBUM_DEBOUNCE_SECONDS", 1.5),
-        rate_limit_messages_per_second=_get_float("TF_RATE_LIMIT_MESSAGES_PER_SECOND", 1.0),
+        album_debounce_seconds=_get_float("TF_ALBUM_DEBOUNCE_SECONDS", 0.8),
+        rate_limit_messages_per_second=_get_float("TF_RATE_LIMIT_MESSAGES_PER_SECOND", 2.0),
+        rate_limit_burst_size=_get_int("TF_RATE_LIMIT_BURST_SIZE", 4),
         healthcheck_interval_seconds=_get_int("TF_HEALTHCHECK_INTERVAL_SECONDS", 60),
         retry_max_attempts=_get_int("TF_RETRY_MAX_ATTEMPTS", 10),
         retry_base_delay_seconds=_get_float("TF_RETRY_BASE_DELAY_SECONDS", 2.0),

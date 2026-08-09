@@ -33,10 +33,12 @@ class TelegramForwarderClient:
     def __init__(
         self,
         settings: TelegramForwarderSettings,
-        queue: ForwarderQueue,
+        message_queue: ForwarderQueue,
+        comment_queue: asyncio.Queue[DiscordPayload],
     ) -> None:
         self._settings = settings
-        self._queue = queue
+        self._message_queue = message_queue
+        self._comment_queue = comment_queue
 
         # Usa StringSession se definido em variavel de ambiente; caso contrario, arquivo SQLite.
         self._media_dir = settings.media_download_dir
@@ -188,7 +190,7 @@ class TelegramForwarderClient:
             tg_message.sender_name,
             len(media_files),
         )
-        await self._queue.put_message(tg_message, media_files)
+        await self._message_queue.put_message(tg_message, media_files)
 
     async def _handle_comment_message(self, message) -> None:
         """Processa um comentario do grupo de discussao vinculado."""
@@ -217,7 +219,7 @@ class TelegramForwarderClient:
         payload = build_discord_payload(tg_message, media_files)
         object.__setattr__(payload, "is_comment", True)
         object.__setattr__(payload, "telegram_channel_message_id", channel_message_id)
-        await self._queue.enqueue(payload)
+        await self._comment_queue.put(payload)
 
     async def _resolve_comment_target(self, message) -> int | None:
         """Tenta extrair o ID da mensagem do canal original a partir de um comentario.
