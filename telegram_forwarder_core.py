@@ -40,12 +40,13 @@ class TelegramForwarderCore:
             maxsize=settings.queue_max_size,
         )
 
+        self._discord_client = DiscordForwarderClient(settings, self._store)
         self._telegram_client = TelegramForwarderClient(
             settings,
             self._message_queue,
             self._comment_queue,
+            self._discord_client,
         )
-        self._discord_client = DiscordForwarderClient(settings, self._store)
         self._tasks: list[asyncio.Task[Any]] = []
         self._shutdown_event = asyncio.Event()
         self._messages_forwarded = 0

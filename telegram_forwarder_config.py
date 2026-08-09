@@ -37,6 +37,8 @@ class TelegramForwarderSettings:
     retry_base_delay_seconds: float
     media_keep_after_send: bool
     forward_comments: bool
+    forward_edits: bool
+    max_edit_age_hours: int
 
 
 def load_telegram_forwarder_settings(env_path: str | Path = ".env") -> TelegramForwarderSettings:
@@ -75,6 +77,8 @@ def load_telegram_forwarder_settings(env_path: str | Path = ".env") -> TelegramF
         retry_base_delay_seconds=_get_float("TF_RETRY_BASE_DELAY_SECONDS", 2.0),
         media_keep_after_send=_get_bool("TF_MEDIA_KEEP_AFTER_SEND", False),
         forward_comments=_get_bool("TF_FORWARD_COMMENTS", True),
+        forward_edits=_get_bool("TF_FORWARD_EDITS", True),
+        max_edit_age_hours=_get_int("TF_MAX_EDIT_AGE_HOURS", 12),
     )
 
     if settings.enabled:

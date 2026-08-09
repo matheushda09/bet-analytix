@@ -35,10 +35,12 @@ class TelegramForwarderClient:
         settings: TelegramForwarderSettings,
         message_queue: ForwarderQueue,
         comment_queue: asyncio.Queue[DiscordPayload],
+        discord_client: Any,
     ) -> None:
         self._settings = settings
         self._message_queue = message_queue
         self._comment_queue = comment_queue
+        self._discord_client = discord_client
 
         # Usa StringSession se definido em variavel de ambiente; caso contrario, arquivo SQLite.
         self._media_dir = settings.media_download_dir
@@ -93,6 +95,10 @@ class TelegramForwarderClient:
             self._client.add_event_handler(
                 self._on_new_message,
                 events.NewMessage(chats=chats),
+            )
+            self._client.add_event_handler(
+                self._on_message_edited,
+                events.MessageEdited(chats=self._settings.source_chat_id),
             )
             self._message_handler_registered = True
 
@@ -174,6 +180,83 @@ class TelegramForwarderClient:
             logger.exception(
                 "Falha ao processar mensagem Telegram message_id=%s; listener continua.",
                 getattr(message, "id", None),
+            )
+
+    async def _on_message_edited(self, event: events.MessageEdited.Event) -> None:
+        """Handler de mensagens editadas no canal de origem."""
+
+        if not self._settings.forward_edits:
+            return
+
+        message = event.message
+        if message is None:
+            return
+
+        chat_id = message.chat_id
+        if chat_id != self._settings.source_chat_id:
+            return
+
+        try:
+            edit_date = getattr(message, "edit_date", None)
+            if edit_date is None:
+                return
+
+            age_hours = (datetime.now(timezone.utc) - edit_date.replace(tzinfo=timezone.utc)).total_seconds() / 3600
+            if age_hours > self._settings.max_edit_age_hours:
+                logger.debug(
+                    "Edicao ignorada por antiguidade: message_id=%s age_hours=%.1f",
+                    message.id,
+                    age_hours,
+                )
+                return
+
+            logger.info(
+                "Mensagem Telegram editada detectada: message_id=%s chat_id=%s age_hours=%.1f",
+                message.id,
+                chat_id,
+                age_hours,
+            )
+            await self._handle_edited_message(message)
+        except Exception:
+            logger.exception(
+                "Falha ao processar edicao Telegram message_id=%s; listener continua.",
+                getattr(message, "id", None),
+            )
+
+    async def _handle_edited_message(self, message) -> None:
+        """Edita a mensagem correspondente no Discord."""
+
+        discord_message_id = self._discord_client.resolve_discord_message_id(
+            self._settings.source_chat_id,
+            int(message.id),
+        )
+        if discord_message_id is None:
+            logger.debug(
+                "Edicao ignorada: mensagem message_id=%s ainda nao encaminhada ao Discord.",
+                message.id,
+            )
+            return
+
+        text = message.text or ""
+        if len(text) > 2000:
+            text = text[:1997] + "..."
+
+        try:
+            await self._discord_client.edit_message(
+                discord_message_id=discord_message_id,
+                new_text=text,
+                telegram_message_id=int(message.id),
+            )
+            logger.info(
+                "Mensagem editada refletida no Discord: telegram_id=%s discord_id=%s",
+                message.id,
+                discord_message_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Falha ao editar mensagem discord_id=%s: %s",
+                discord_message_id,
+                exc,
             )
 
     async def _handle_channel_message(self, message) -> None:

@@ -379,6 +379,37 @@ class DiscordForwarderClient(discord.Client):
             return clean
         return clean[:77] + "..."
 
+    async def edit_message(
+        self,
+        discord_message_id: int,
+        new_text: str,
+        telegram_message_id: int | None = None,
+    ) -> None:
+        """Edita uma mensagem previamente enviada no canal Discord."""
+
+        await self.wait_until_ready()
+        await self._throttle()
+
+        channel = await self._resolve_channel(self._target_channel_id)
+        try:
+            discord_message = await channel.fetch_message(discord_message_id)
+        except discord.NotFound:
+            logger.warning(
+                "Mensagem Discord nao encontrada para edicao: telegram_id=%s discord_id=%s",
+                telegram_message_id,
+                discord_message_id,
+            )
+            return
+
+        text = self._sanitize_text(new_text)
+        await discord_message.edit(content=text)
+        logger.info(
+            "Mensagem editada no Discord: telegram_id=%s discord_id=%s",
+            telegram_message_id,
+            discord_message_id,
+        )
+        self._last_send_time = asyncio.get_event_loop().time()
+
     async def close(self) -> None:
         self._shutdown = True
         await super().close()
