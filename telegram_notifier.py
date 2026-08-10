@@ -21,6 +21,10 @@ class TelegramError(RuntimeError):
     """Erro ao enviar mensagem para o Telegram."""
 
 
+class TelegramChatNotFoundError(TelegramError):
+    """Chat de destino nao existe ou bot nao tem acesso; nao e retryavel."""
+
+
 @dataclass(frozen=True)
 class SentTelegramMessage:
     """Mensagem enviada e identificadores retornados pelo Telegram."""
@@ -116,7 +120,12 @@ class TelegramNotifier:
                 continue
 
             if response.status_code >= 400:
-                raise TelegramError(f"Telegram retornou HTTP {response.status_code}: {response.text[:500]}")
+                error_text = response.text[:500]
+                if response.status_code == 400 and "chat not found" in error_text.lower():
+                    raise TelegramChatNotFoundError(
+                        f"Telegram chat nao encontrado/inacessivel: {error_text}"
+                    )
+                raise TelegramError(f"Telegram retornou HTTP {response.status_code}: {error_text}")
 
             try:
                 payload = response.json()

@@ -28,7 +28,7 @@ from models import (
 )
 from operational_alerts import OperationalAlerter
 from telegram_reaction_listener import TelegramReactionListener
-from telegram_notifier import TelegramNotifier
+from telegram_notifier import TelegramChatNotFoundError, TelegramNotifier
 
 
 logger = logging.getLogger(__name__)
@@ -115,7 +115,15 @@ class BetMonitor:
             return
 
         for bet in new_bets:
-            sent_message = self._notifier.send_bet(bet, chat_id=self._delivery_chat_id())
+            try:
+                sent_message = self._notifier.send_bet(bet, chat_id=self._delivery_chat_id())
+            except TelegramChatNotFoundError:
+                logger.warning(
+                    "Chat Telegram inacessivel para notificacao; continuando sem enviar. bet_id=%s",
+                    bet.id,
+                )
+                self._store.mark_notified(bet)
+                continue
             self._store.save_telegram_message(sent_message.chat_id, sent_message.message_id, sent_message.text)
             self._store.mark_notified(bet)
             logger.info("Aposta nova enviada ao Telegram: bet_id=%s tipster=%s", bet.id, bet.tipster_name)
@@ -123,7 +131,15 @@ class BetMonitor:
     def _handle_first_successful_poll(self, current_bets: list[Bet]) -> None:
         if self._settings.notify_existing_on_first_run:
             for bet in current_bets:
-                sent_message = self._notifier.send_bet(bet, chat_id=self._delivery_chat_id())
+                try:
+                    sent_message = self._notifier.send_bet(bet, chat_id=self._delivery_chat_id())
+                except TelegramChatNotFoundError:
+                    logger.warning(
+                        "Chat Telegram inacessivel no primeiro boot; continuando sem enviar. bet_id=%s",
+                        bet.id,
+                    )
+                    self._store.mark_notified(bet)
+                    continue
                 self._store.save_telegram_message(sent_message.chat_id, sent_message.message_id, sent_message.text)
                 self._store.mark_notified(bet)
                 logger.info("Aposta histórica enviada no primeiro boot: bet_id=%s", bet.id)
