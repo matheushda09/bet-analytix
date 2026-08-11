@@ -712,6 +712,22 @@ class BetAnalytixWriter:
             if best_partial is not None:
                 matched_name, score, _ = best_partial
                 matched_id = self._bookmakers_by_name[matched_name]
+                # Se o match e muito mais curto que o input, exigir que seja
+                # prefixo ou sufixo do input. Isso evita falsos positivos como
+                # "betbra" (6 caracteres) sendo considerado dentro de
+                # "superbetbrasil" (14 caracteres) apenas por conter "betbra".
+                if len(matched_name) < len(normalized_input) * 0.75:
+                    if not (
+                        normalized_input.startswith(matched_name)
+                        or normalized_input.endswith(matched_name)
+                    ):
+                        logger.debug(
+                            "Fuzzy match parcial rejeitado por nao ser prefixo/sufixo: '%s' -> '%s' (score=%s).",
+                            bookmaker_name,
+                            matched_name,
+                            score,
+                        )
+                        return None
                 logger.warning(
                     "Fuzzy match de casa (partial): '%s' -> '%s' (score=%s, id=%s).",
                     bookmaker_name,
