@@ -352,6 +352,56 @@ class BetAnalytixWriter:
             raise BetAnalytixWriterError(f"Resposta inesperada ao atualizar aposta {bet_id}: {response!r}")
         return response
 
+    def delete_pending_bet(self, bet_id: int) -> None:
+        """Exclui UMA aposta pendente da bankroll de destino (desplanilhar).
+
+        Recusa apostas ja resolvidas e apostas de outra bankroll. Depois do
+        DELETE confere com um GET que a aposta sumiu.
+        """
+
+        self._ensure_authenticated()
+        raw_bet = self._request_json(
+            "GET",
+            f"/bet/{int(bet_id)}",
+            authenticated=True,
+            allow_existing_bet_read=True,
+        )
+        if not isinstance(raw_bet, dict):
+            raise BetAnalytixWriterError(f"Resposta inesperada ao buscar aposta {bet_id}: {raw_bet!r}")
+        bankroll = to_int(raw_bet.get("bankroll"))
+        expected_bankrolls = {
+            to_int(self._settings.copytrade_bankroll_internal_id),
+            to_int(self._settings.copytrade_bankroll_id),
+        } - {None}
+        if bankroll is not None and expected_bankrolls and bankroll not in expected_bankrolls:
+            raise BetAnalytixWriterError(f"Aposta {bet_id} nao pertence a bankroll desta instancia; exclusao bloqueada.")
+        state = to_int(raw_bet.get("state")) or 0
+        if state != 0:
+            raise BetAnalytixWriterError(
+                f"Aposta {bet_id} ja foi resolvida (state={state}); exclua manualmente se quiser."
+            )
+
+        self._request_json(
+            "DELETE",
+            f"/bet/{int(bet_id)}",
+            authenticated=True,
+            allow_existing_bet_delete=True,
+        )
+
+        try:
+            self._request_json(
+                "GET",
+                f"/bet/{int(bet_id)}",
+                authenticated=True,
+                allow_existing_bet_read=True,
+            )
+        except BetAnalytixWriterError as exc:
+            if "404" in str(exc):
+                return
+            raise
+        # Algumas APIs fazem soft delete e ainda respondem o GET; registra para conferencia.
+        logger.warning("Aposta bet_id=%s ainda responde apos DELETE; confira no Bet-Analytix.", bet_id)
+
     def update_bet_state(
         self,
         bet_id: int,
@@ -1020,12 +1070,14 @@ class BetAnalytixWriter:
         authenticated: bool = False,
         allow_existing_bet_read: bool = False,
         allow_existing_bet_update: bool = False,
+        allow_existing_bet_delete: bool = False,
     ) -> Any:
         self._assert_non_destructive_request(
             method,
             path,
             allow_existing_bet_read=allow_existing_bet_read,
             allow_existing_bet_update=allow_existing_bet_update,
+            allow_existing_bet_delete=allow_existing_bet_delete,
         )
         url = f"{self._settings.api_base_url}{path}"
         last_error: Exception | None = None
@@ -1222,8 +1274,12 @@ class BetAnalytixWriter:
         path: str,
         allow_existing_bet_read: bool = False,
         allow_existing_bet_update: bool = False,
+        allow_existing_bet_delete: bool = False,
     ) -> None:
         """Bloqueia qualquer chamada capaz de apagar ou alterar apostas existentes.
+
+        Unica excecao destrutiva: `DELETE /bet/{id}` com flag explicita, usada
+        apenas pelo ❌ do proprio usuario na DM de confirmacao daquela aposta.
 
         O CopyTrade so precisa ler referencias, criar uma aposta nova com
         `POST /bet` e, opcionalmente, criar tipsters. Endpoints destrutivos
@@ -1239,6 +1295,8 @@ class BetAnalytixWriter:
             if allow_existing_bet_read and normalized_method == "GET":
                 return
             if allow_existing_bet_update and normalized_method == "PUT":
+                return
+            if allow_existing_bet_delete and normalized_method == "DELETE":
                 return
 
         if normalized_method in {"DELETE", "PATCH", "PUT"}:

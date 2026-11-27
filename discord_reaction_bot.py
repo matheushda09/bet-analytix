@@ -85,6 +85,10 @@ HEART_EMOJIS = {
 }
 
 
+CANCEL_EMOJIS = {"\u274C", "\u2716", "\u2716\uFE0F", "\u274E"}
+CANCEL_EMOJI = "\u274C"
+
+
 class DiscordSignalClient(discord.Client):
     """Cliente Discord que escuta reacoes e processa a fila Bet-Analytix."""
 
@@ -384,10 +388,68 @@ class DiscordSignalClient(discord.Client):
             logger.exception("Falha ao confirmar correcao de casa no DM.")
         await self.process_due_jobs_once()
 
+    async def _handle_dm_reaction(self, payload: discord.RawReactionActionEvent) -> None:
+        """❌ do admin na DM de confirmacao = desplanilhar aquela aposta."""
+
+        if self.user is not None and int(payload.user_id) == int(self.user.id):
+            return
+        if self._settings.admin_user_id is None or int(payload.user_id) != self._settings.admin_user_id:
+            return
+        if str(payload.emoji) not in CANCEL_EMOJIS:
+            return
+        prompt = self._store.get_stake_prompt(int(payload.message_id))
+        if prompt is None:
+            return
+
+        channel = self.get_channel(int(payload.channel_id))
+        if channel is None:
+            channel = await self.fetch_channel(int(payload.channel_id))
+
+        async def reply(text: str) -> None:
+            try:
+                original = await channel.fetch_message(int(payload.message_id))
+                await original.reply(text, mention_author=False)
+            except Exception:
+                logger.exception("Falha ao responder desplanilhar na DM.")
+
+        bet_id = int(prompt["bet_analytix_bet_id"])
+        if prompt["cancelled_at_ts"]:
+            await reply(f"ℹ️ A aposta {bet_id} já foi desplanilhada.")
+            return
+
+        try:
+            await asyncio.to_thread(self._writer.delete_pending_bet, bet_id)
+        except Exception as exc:
+            logger.exception("Falha ao desplanilhar bet_id=%s.", bet_id)
+            await reply(
+                f"❌ Não consegui desplanilhar a aposta {bet_id}: {exc}\n"
+                "Se precisar, exclua manualmente no Bet-Analytix."
+            )
+            await self._alert_async(
+                "Falha ao desplanilhar aposta pelo Discord",
+                f"bet_id={bet_id}\nerro={exc}",
+                f"discord_cancel_{bet_id}",
+            )
+            return
+
+        self._store.cancel_planilhada_bet(int(prompt["dm_message_id"]), int(prompt["job_id"]))
+        logger.info(
+            "Aposta desplanilhada pelo admin: bet_id=%s source_bet_id=%s",
+            bet_id,
+            prompt["source_bet_id"],
+        )
+        await reply(
+            f"🗑️ Aposta {bet_id} desplanilhada do Bet-Analytix. "
+            "Se quiser planilhar de novo, reaja 👍 no sinal outra vez."
+        )
+
     async def _handle_stake_reply(self, message: discord.Message, prompt: sqlite3.Row) -> None:
         """Atualiza a stake da aposta a partir da resposta do usuario na DM."""
 
         bet_id = int(prompt["bet_analytix_bet_id"])
+        if prompt["cancelled_at_ts"]:
+            await self._safe_dm_reply(message, f"ℹ️ A aposta {bet_id} foi desplanilhada; nada a alterar.")
+            return
         try:
             reply = parse_stake_reply(message.content)
         except StakeReplyError as exc:
@@ -611,6 +673,10 @@ class DiscordSignalClient(discord.Client):
             )
 
     async def _handle_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        if payload.guild_id is None:
+            await self._handle_dm_reaction(payload)
+            return
+
         guild_id = int(payload.guild_id or 0)
         channel_id = int(payload.channel_id)
         message_id = int(payload.message_id)
@@ -898,9 +964,8 @@ class DiscordSignalClient(discord.Client):
             if warnings:
                 lines.append("")
                 lines.extend(warnings)
-            can_adjust_stake = (
-                bet_analytix_bet_id is not None and job_id is not None and not tip.is_accumulator
-            )
+            has_bet = bet_analytix_bet_id is not None and job_id is not None
+            can_adjust_stake = has_bet and not tip.is_accumulator
             if can_adjust_stake:
                 lines.extend(
                     [
@@ -909,14 +974,21 @@ class DiscordSignalClient(discord.Client):
                         "com o valor: R$43 (reais) ou $8 (dólares). Se a odd mudou: R$43 @2.05",
                     ]
                 )
+            if has_bet and not already_exists:
+                lines.append(f"{CANCEL_EMOJI} Para desplanilhar esta aposta, clique no {CANCEL_EMOJI} abaixo.")
             sent = await user.send("\n".join(lines))
-            if can_adjust_stake:
+            if has_bet:
                 self._store.record_stake_prompt(
                     dm_message_id=int(sent.id),
                     job_id=int(job_id),
                     source_bet_id=tip.source_bet_id,
                     bet_analytix_bet_id=int(bet_analytix_bet_id),
                 )
+            if has_bet and not already_exists:
+                try:
+                    await sent.add_reaction(CANCEL_EMOJI)
+                except Exception:
+                    logger.exception("Falha ao adicionar reacao de desplanilhar na DM.")
             logger.info("DM de confirmacao enviada para admin=%s source_bet_id=%s.", self._settings.admin_user_id, tip.source_bet_id)
         except Exception:
             logger.exception("Falha ao enviar DM de confirmacao no Discord para source_bet_id=%s.", tip.source_bet_id)

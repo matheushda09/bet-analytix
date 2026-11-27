@@ -250,7 +250,7 @@ class StakeReplyHandlerTests(unittest.TestCase):
 
         client = self._client()
         message = self._message("$ 8,50")
-        prompt = {"bet_analytix_bet_id": 555, "raw_message": FISHBOT_USD_SIGNAL, "dm_message_id": 999, "job_id": 1, "source_bet_id": 123}
+        prompt = {"bet_analytix_bet_id": 555, "raw_message": FISHBOT_USD_SIGNAL, "dm_message_id": 999, "job_id": 1, "source_bet_id": 123, "cancelled_at_ts": None}
 
         asyncio.run(client._handle_stake_reply(message, prompt))
 
@@ -261,7 +261,7 @@ class StakeReplyHandlerTests(unittest.TestCase):
     def test_invalid_reply_does_not_touch_bet(self) -> None:
         client = self._client()
         message = self._message("valeu")
-        prompt = {"bet_analytix_bet_id": 555, "raw_message": None, "dm_message_id": 999, "job_id": 1, "source_bet_id": 123}
+        prompt = {"bet_analytix_bet_id": 555, "raw_message": None, "dm_message_id": 999, "job_id": 1, "source_bet_id": 123, "cancelled_at_ts": None}
 
         asyncio.run(client._handle_stake_reply(message, prompt))
 
@@ -271,3 +271,106 @@ class StakeReplyHandlerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CancelBetTests(unittest.TestCase):
+    def _writer(self, raw_bet, delete_error=None, still_exists=False):
+        writer = object.__new__(BetAnalytixWriter)
+        writer._settings = SimpleNamespace(copytrade_bankroll_internal_id=3, copytrade_bankroll_id=1829516)
+        writer._access_token = "token"
+        calls: list[tuple[str, str]] = []
+
+        def fake_request(method, path, json_payload=None, authenticated=False, **kwargs):
+            writer._assert_non_destructive_request(
+                method,
+                path,
+                allow_existing_bet_read=kwargs.get("allow_existing_bet_read", False),
+                allow_existing_bet_update=kwargs.get("allow_existing_bet_update", False),
+                allow_existing_bet_delete=kwargs.get("allow_existing_bet_delete", False),
+            )
+            calls.append((method, path))
+            if method == "DELETE":
+                if delete_error:
+                    raise BetAnalytixWriterError(delete_error)
+                return None
+            if method == "GET" and ("DELETE", path) in calls and not still_exists:
+                raise BetAnalytixWriterError("Bet-Analytix retornou HTTP 404: not found")
+            return raw_bet
+
+        writer._request_json = fake_request
+        writer.calls = calls
+        return writer
+
+    def test_deletes_pending_bet_of_this_bankroll(self) -> None:
+        writer = self._writer({"state": 0, "bankroll": 3})
+        writer.delete_pending_bet(555)
+        self.assertIn(("DELETE", "/bet/555"), writer.calls)
+
+    def test_refuses_settled_or_foreign_bets(self) -> None:
+        for raw in ({"state": 1, "bankroll": 3}, {"state": 0, "bankroll": 99}):
+            with self.subTest(raw=raw):
+                writer = self._writer(raw)
+                with self.assertRaises(BetAnalytixWriterError):
+                    writer.delete_pending_bet(555)
+                self.assertNotIn(("DELETE", "/bet/555"), writer.calls)
+
+    def test_delete_still_blocked_without_explicit_flag(self) -> None:
+        writer = object.__new__(BetAnalytixWriter)
+        with self.assertRaises(BetAnalytixWriterError):
+            writer._assert_non_destructive_request("DELETE", "/bet/555")
+        with self.assertRaises(BetAnalytixWriterError):
+            writer._assert_non_destructive_request("DELETE", "/bankroll/1", allow_existing_bet_delete=True)
+
+    def test_store_cancel_frees_message_for_new_reaction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = DiscordSignalStore(Path(temp_dir) / "signals.sqlite3")
+            store.initialize()
+            tip = ParsedTelegramTip(
+                tipster="PeixeEsperto",
+                event_datetime=datetime.now(timezone.utc),
+                sport="Futebol",
+                league=None,
+                pick="A x B: A",
+                odd=2.0,
+                stake=27,
+                bookmaker="99play",
+                source_bet_id=123,
+                event="A x B",
+            )
+            store.enqueue_signal(1, 2, 3, 4, 5, tip, raw_message="sinal")
+            job_id = store.get_job_by_message(1, 2, 3)["id"]
+            store.record_stake_prompt(999, job_id, 123, 555)
+
+            store.cancel_planilhada_bet(999, job_id)
+
+            self.assertIsNotNone(store.get_stake_prompt(999)["cancelled_at_ts"])
+            self.assertIsNone(store.get_job_by_message(1, 2, 3))
+            self.assertTrue(store.enqueue_signal(1, 2, 3, 4, 5, tip, raw_message="sinal"))
+
+    def test_dm_cancel_reaction_only_from_admin(self) -> None:
+        from discord_reaction_bot import DiscordSignalClient
+
+        client = object.__new__(DiscordSignalClient)
+        client._settings = SimpleNamespace(admin_user_id=42)
+        client._connection = mock.Mock(user=SimpleNamespace(id=7))
+        client._writer = mock.Mock()
+        client._store = mock.Mock()
+        client._store.get_stake_prompt.return_value = {
+            "bet_analytix_bet_id": 555,
+            "dm_message_id": 999,
+            "job_id": 1,
+            "source_bet_id": 123,
+            "cancelled_at_ts": None,
+        }
+        channel = mock.Mock()
+        channel.fetch_message = mock.AsyncMock(return_value=mock.Mock(reply=mock.AsyncMock()))
+        client.get_channel = mock.Mock(return_value=channel)
+
+        bot_payload = SimpleNamespace(user_id=7, emoji="❌", message_id=999, channel_id=5)
+        asyncio.run(client._handle_dm_reaction(bot_payload))
+        client._writer.delete_pending_bet.assert_not_called()
+
+        admin_payload = SimpleNamespace(user_id=42, emoji="❌", message_id=999, channel_id=5)
+        asyncio.run(client._handle_dm_reaction(admin_payload))
+        client._writer.delete_pending_bet.assert_called_once_with(555)
+        client._store.cancel_planilhada_bet.assert_called_once_with(999, 1)

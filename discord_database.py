@@ -195,10 +195,15 @@ class DiscordSignalStore:
                     bet_analytix_bet_id INTEGER NOT NULL,
                     created_at_ts INTEGER NOT NULL,
                     adjusted_stake REAL,
-                    adjusted_at_ts INTEGER
+                    adjusted_at_ts INTEGER,
+                    cancelled_at_ts INTEGER
                 )
                 """
             )
+            try:
+                connection.execute("ALTER TABLE discord_stake_prompts ADD COLUMN cancelled_at_ts INTEGER")
+            except sqlite3.OperationalError:
+                pass
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bet_states (
@@ -328,6 +333,20 @@ class DiscordSignalStore:
                 """,
                 (int(dm_message_id),),
             ).fetchone()
+
+    def cancel_planilhada_bet(self, dm_message_id: int, job_id: int) -> None:
+        """Marca a DM como desplanilhada e remove o job local.
+
+        Remover o job tira a aposta do sync de resultados, do relatorio de EV e
+        do aviso de selecao repetida, e permite reagir 👍 de novo no sinal.
+        """
+
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE discord_stake_prompts SET cancelled_at_ts = ? WHERE dm_message_id = ?",
+                (int(time.time()), int(dm_message_id)),
+            )
+            connection.execute("DELETE FROM discord_signal_jobs WHERE id = ?", (int(job_id),))
 
     def record_stake_adjustment(self, dm_message_id: int, job_id: int, stake: float) -> None:
         """Guarda a nova stake no prompt e no payload do job (auditoria)."""
