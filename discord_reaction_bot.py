@@ -43,6 +43,13 @@ from userbot_signal_parser import (
     parse_external_signal,
 )
 from userbot_telegram_notifier import UserbotTelegramNotifier
+from stake_reply import (
+    USD,
+    StakeReplyError,
+    UsdBrlRateProvider,
+    parse_stake_reply,
+    stake_in_brl,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -109,6 +116,7 @@ class DiscordSignalClient(discord.Client):
         self._green_sync_scheduler_task: asyncio.Task[None] | None = None
         self._peixeesperto_scheduler_task: asyncio.Task[None] | None = None
         self._sports_event_recheck_task: asyncio.Task[None] | None = None
+        self._usd_brl_rate_provider = UsdBrlRateProvider(fixed_rate=discord_settings.usd_brl_rate)
 
     async def setup_hook(self) -> None:
         """Inicializa tarefas de fundo depois que o cliente esta pronto."""
@@ -249,6 +257,7 @@ class DiscordSignalClient(discord.Client):
                     tip=tip,
                     bet_analytix_bet_id=created_id,
                     already_exists=_response_already_exists(response),
+                    job_id=job_id,
                 )
                 await self._notify_success(
                     tip=tip,
@@ -321,6 +330,15 @@ class DiscordSignalClient(discord.Client):
         if not isinstance(message.channel, discord.DMChannel):
             return
 
+        # Resposta (reply) a uma confirmacao de aposta = nova stake. Tem
+        # prioridade sobre a correcao de casa para nao virar nome de casa.
+        reference_id = message.reference.message_id if message.reference is not None else None
+        if reference_id is not None:
+            prompt = self._store.get_stake_prompt(int(reference_id))
+            if prompt is not None:
+                await self._handle_stake_reply(message, prompt)
+                return
+
         pending_jobs = self._store.get_jobs_awaiting_bookmaker(limit=1)
         if not pending_jobs:
             return
@@ -345,6 +363,82 @@ class DiscordSignalClient(discord.Client):
         except Exception:
             logger.exception("Falha ao confirmar correcao de casa no DM.")
         await self.process_due_jobs_once()
+
+    async def _handle_stake_reply(self, message: discord.Message, prompt: sqlite3.Row) -> None:
+        """Atualiza a stake da aposta a partir da resposta do usuario na DM."""
+
+        bet_id = int(prompt["bet_analytix_bet_id"])
+        try:
+            reply = parse_stake_reply(message.content)
+        except StakeReplyError as exc:
+            await self._safe_dm_reply(
+                message,
+                f"⚠️ Não entendi o valor ({exc}).\n"
+                "Responda à mensagem da aposta com, por exemplo: R$43 (reais) ou $8 (dólares).",
+            )
+            return
+
+        signal_rate = None
+        raw_message = prompt["raw_message"]
+        if raw_message:
+            try:
+                signal_rate = parse_external_signal(
+                    str(raw_message),
+                    signal_marker_pattern=ODD_CHANGED_MARKER_PATTERN,
+                ).usd_brl_rate
+            except UserbotSignalParseError:
+                signal_rate = None
+
+        try:
+            stake_brl, rate = await asyncio.to_thread(
+                stake_in_brl,
+                reply,
+                signal_rate,
+                self._usd_brl_rate_provider,
+            )
+        except StakeReplyError as exc:
+            await self._safe_dm_reply(message, f"⚠️ {exc}")
+            return
+
+        try:
+            await asyncio.to_thread(self._writer.update_bet_stake, bet_id, stake_brl)
+        except Exception as exc:
+            logger.exception("Falha ao atualizar stake bet_id=%s.", bet_id)
+            await self._safe_dm_reply(
+                message,
+                f"❌ Não consegui atualizar a stake no Bet-Analytix (ID {bet_id}): {exc}\n"
+                "Tente responder novamente em instantes.",
+            )
+            await self._alert_async(
+                "Falha ao ajustar stake pelo Discord",
+                f"bet_id={bet_id}\nerro={exc}",
+                f"discord_stake_adjust_{bet_id}",
+            )
+            return
+
+        self._store.record_stake_adjustment(int(prompt["dm_message_id"]), int(prompt["job_id"]), stake_brl)
+        if reply.currency == USD:
+            conversion = f" (US${reply.amount:.2f} × {rate:.4f})".replace(".", ",")
+        else:
+            conversion = ""
+        logger.info(
+            "Stake ajustada pelo admin: bet_id=%s source_bet_id=%s stake=%.2f moeda=%s cotacao=%s",
+            bet_id,
+            prompt["source_bet_id"],
+            stake_brl,
+            reply.currency,
+            rate,
+        )
+        await self._safe_dm_reply(
+            message,
+            f"✅ Stake atualizada para {_format_brl(stake_brl)}{conversion} no Bet-Analytix (ID {bet_id}).",
+        )
+
+    async def _safe_dm_reply(self, message: discord.Message, text: str) -> None:
+        try:
+            await message.reply(text, mention_author=False)
+        except Exception:
+            logger.exception("Falha ao responder no DM do Discord.")
 
     async def _ask_admin_for_bookmaker(
         self,
@@ -570,7 +664,7 @@ class DiscordSignalClient(discord.Client):
             tipster=self._settings.destination_tipster_name,
             event_datetime=event_datetime,
             sport=signal.sport,
-            league=None,
+            league=signal.league,
             pick=_pick_label(signal.event, signal.pick),
             odd=signal.odd,
             stake=signal.stake,
@@ -620,6 +714,7 @@ class DiscordSignalClient(discord.Client):
         tip: ParsedTelegramTip,
         bet_analytix_bet_id: int | None,
         already_exists: bool,
+        job_id: int | None = None,
     ) -> None:
         """Envia DM no Discord para o admin confirmando a aposta planilhada."""
 
@@ -631,17 +726,44 @@ class DiscordSignalClient(discord.Client):
                 logger.warning("Nao foi possivel encontrar usuario Discord admin=%s para DM.", self._settings.admin_user_id)
                 return
             status = "ja existia" if already_exists else "criada"
-            message = (
-                f"✅ Aposta {status} no Bet-Analytix\n"
-                f"Tipster: {tip.tipster}\n"
-                f"Evento: {tip.event}\n"
-                f"Pick: {tip.pick}\n"
-                f"Odd: {tip.odd}\n"
-                f"Stake: {tip.stake}\n"
-                f"Bookmaker: {tip.bookmaker}\n"
-                f"ID Bet-Analytix: {bet_analytix_bet_id or 'N/A'}"
+            lines = [
+                f"✅ Aposta {status} no Bet-Analytix",
+                f"Tipster: {tip.tipster}",
+                f"Evento: {tip.event}",
+            ]
+            if tip.league:
+                lines.append(f"Campeonato: {tip.league}")
+            lines.append(
+                f"Data/hora: {_format_local_datetime(tip.event_datetime, self._base_settings.timezone)}"
             )
-            await user.send(message)
+            lines.extend(
+                [
+                    f"Pick: {tip.pick}",
+                    f"Odd: {tip.odd}",
+                    f"Stake: {_format_brl(tip.stake)}",
+                    f"Bookmaker: {tip.bookmaker}",
+                    f"ID Bet-Analytix: {bet_analytix_bet_id or 'N/A'}",
+                ]
+            )
+            can_adjust_stake = (
+                bet_analytix_bet_id is not None and job_id is not None and not tip.is_accumulator
+            )
+            if can_adjust_stake:
+                lines.extend(
+                    [
+                        "",
+                        "💬 Deseja colocar um valor diferente da stake? Responda a esta mensagem "
+                        "com o valor: R$43 (reais) ou $8 (dólares).",
+                    ]
+                )
+            sent = await user.send("\n".join(lines))
+            if can_adjust_stake:
+                self._store.record_stake_prompt(
+                    dm_message_id=int(sent.id),
+                    job_id=int(job_id),
+                    source_bet_id=tip.source_bet_id,
+                    bet_analytix_bet_id=int(bet_analytix_bet_id),
+                )
             logger.info("DM de confirmacao enviada para admin=%s source_bet_id=%s.", self._settings.admin_user_id, tip.source_bet_id)
         except Exception:
             logger.exception("Falha ao enviar DM de confirmacao no Discord para source_bet_id=%s.", tip.source_bet_id)
@@ -1120,6 +1242,20 @@ def _writer_settings_for_discord(base_settings: Settings, discord_settings: Disc
         copytrade_destination_tipster_name=tipster_name,
         copytrade_destination_tipster_id=None,
     )
+
+
+def _format_brl(value: float) -> str:
+    formatted = f"{float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R${formatted}"
+
+
+def _format_local_datetime(value: datetime, local_timezone_name: str) -> str:
+    try:
+        local_timezone = ZoneInfo(local_timezone_name)
+    except Exception:
+        local_timezone = ZoneInfo("America/Sao_Paulo")
+    local_value = value.replace(tzinfo=local_timezone) if value.tzinfo is None else value.astimezone(local_timezone)
+    return local_value.strftime("%d/%m/%Y %H:%M")
 
 
 def _pick_label(event: str, pick: str) -> str:

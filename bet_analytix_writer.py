@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 # Score minimo (0-100) para aceitar fuzzy match de casa.
 BOOKMAKER_FUZZY_MATCH_THRESHOLD = int(os.getenv("BOOKMAKER_FUZZY_MATCH_THRESHOLD", "80"))
+# Intervalo minimo entre recargas do catalogo quando uma casa nao e encontrada.
+BOOKMAKER_CATALOG_REFRESH_SECONDS = float(os.getenv("BOOKMAKER_CATALOG_REFRESH_SECONDS", "60"))
 
 
 class BetAnalytixWriterError(RuntimeError):
@@ -39,6 +41,7 @@ class BetAnalytixWriter:
         self._refresh_token: str | None = None
         self._bookmakers_by_name: dict[str, int] | None = None
         self._bookmaker_ids: set[int] | None = None
+        self._bookmakers_loaded_at: float = 0.0
         self._fixed_destination_tipster_id: int | None = settings.copytrade_destination_tipster_id
         self._destination_user_id: int | None = None
         self._destination_tipsters_by_name: dict[str, int] | None = None
@@ -89,7 +92,7 @@ class BetAnalytixWriter:
                     "status": 0,
                     "showDetails": False,
                     "category": None,
-                    "competition": None,
+                    "competition": _competition_value(tip),
                     "betType": None,
                     "closing": None,
                     "estimatedProbability": None,
@@ -118,7 +121,7 @@ class BetAnalytixWriter:
             "stake": tip.stake,
         }
 
-        response = self._request_json("POST", "/bet", json_payload=payload, authenticated=True)
+        response = self._post_bet(payload)
         if not isinstance(response, list):
             raise BetAnalytixWriterError(f"Resposta inesperada ao criar aposta: {response!r}")
         return [item for item in response if isinstance(item, dict)]
@@ -172,7 +175,7 @@ class BetAnalytixWriter:
                     "sport": sport_id,
                     "status": 0,
                     "category": None,
-                    "competition": None,
+                    "competition": _competition_value(tip),
                     "betType": None,
                     "closing": None,
                     "estimatedProbability": None,
@@ -213,10 +216,37 @@ class BetAnalytixWriter:
             "stake": tip.stake,
         }
 
-        response = self._request_json("POST", "/bet", json_payload=payload, authenticated=True)
+        response = self._post_bet(payload)
         if not isinstance(response, list):
             raise BetAnalytixWriterError(f"Resposta inesperada ao criar aposta multipla: {response!r}")
         return [item for item in response if isinstance(item, dict)]
+
+    def _post_bet(self, payload: dict[str, Any]) -> Any:
+        """Cria a aposta; se o campeonato for recusado, tenta de novo sem ele.
+
+        O campeonato e informativo: um HTTP 4xx causado por ele nao pode
+        impedir que a aposta seja planilhada.
+        """
+
+        has_competition = any(
+            isinstance(selection, dict) and selection.get("competition")
+            for selection in payload.get("selections", [])
+        )
+        try:
+            return self._request_json("POST", "/bet", json_payload=payload, authenticated=True)
+        except BetAnalytixWriterError as exc:
+            if not has_competition or not _is_client_error(exc):
+                raise
+            logger.warning(
+                "Bet-Analytix recusou a aposta com campeonato (%s); reenviando sem campeonato.",
+                exc,
+            )
+            fallback_payload = dict(payload)
+            fallback_payload["selections"] = [
+                {**selection, "competition": None} if isinstance(selection, dict) else selection
+                for selection in payload.get("selections", [])
+            ]
+            return self._request_json("POST", "/bet", json_payload=fallback_payload, authenticated=True)
 
     def update_bet_datetime(self, bet_id: int, event_datetime: datetime) -> dict[str, Any] | None:
         """Atualiza exclusivamente a data/hora de uma aposta simples existente.
@@ -266,6 +296,43 @@ class BetAnalytixWriter:
         )
         if not isinstance(raw_bet, dict):
             raise BetAnalytixWriterError(f"Resposta inesperada ao buscar aposta {bet_id}: {raw_bet!r}")
+
+        payload = self._build_odd_stake_update_payload(bet_id, raw_bet, odd, stake)
+        response = self._request_json(
+            "PUT",
+            f"/bet/{bet_id}",
+            json_payload=payload,
+            authenticated=True,
+            allow_existing_bet_update=True,
+        )
+        if response is None:
+            return None
+        if isinstance(response, list):
+            first_item = response[0] if response else None
+            if isinstance(first_item, dict):
+                return first_item
+        if not isinstance(response, dict):
+            raise BetAnalytixWriterError(f"Resposta inesperada ao atualizar aposta {bet_id}: {response!r}")
+        return response
+
+    def update_bet_stake(self, bet_id: int, stake: float) -> dict[str, Any] | None:
+        """Atualiza somente a stake de uma aposta simples, mantendo a odd atual."""
+
+        self._ensure_authenticated()
+        raw_bet = self._request_json(
+            "GET",
+            f"/bet/{bet_id}",
+            authenticated=True,
+            allow_existing_bet_read=True,
+        )
+        if not isinstance(raw_bet, dict):
+            raise BetAnalytixWriterError(f"Resposta inesperada ao buscar aposta {bet_id}: {raw_bet!r}")
+        try:
+            odd = float(str(raw_bet.get("odds") or "").replace(",", "."))
+        except ValueError as exc:
+            raise BetAnalytixWriterError(f"Aposta {bet_id} sem odd valida; ajuste de stake bloqueado.") from exc
+        if odd <= 1:
+            raise BetAnalytixWriterError(f"Aposta {bet_id} sem odd valida; ajuste de stake bloqueado.")
 
         payload = self._build_odd_stake_update_payload(bet_id, raw_bet, odd, stake)
         response = self._request_json(
@@ -588,24 +655,53 @@ class BetAnalytixWriter:
                 return name
         return None
 
-    def _load_bookmakers(self) -> None:
-        """Carrega o catalogo de bookmakers uma unica vez."""
+    def _load_bookmakers(self, refresh: bool = False) -> None:
+        """Carrega o catalogo de casas (publico + casas da conta).
 
-        if self._bookmakers_by_name is not None:
+        O endpoint publico `/bookmakers` nao traz casas personalizadas da
+        conta (ex.: casas criadas pelo proprio usuario). Elas vem em
+        `/bankroll/all-data/{id_user}`, que e por usuario; por isso cada
+        perfil/instancia carrega o seu proprio catalogo.
+        """
+
+        if self._bookmakers_by_name is not None and not refresh:
             return
         payload = self._request_json("GET", "/bookmakers", authenticated=False)
         if not isinstance(payload, list):
             raise BetAnalytixWriterError("Catalogo de bookmakers retornou payload inesperado.")
-        self._bookmakers_by_name = {
-            _normalize_text(str(item.get("name"))): int(item["id"])
-            for item in payload
-            if isinstance(item, dict) and item.get("id") is not None and item.get("name")
-        }
-        self._bookmaker_ids = {
-            int(item["id"])
-            for item in payload
-            if isinstance(item, dict) and item.get("id") is not None
-        }
+        public_entries = _extract_bookmaker_entries(payload)
+        account_entries = self._load_account_bookmaker_entries()
+
+        by_name: dict[str, int] = {}
+        # O catalogo publico manda em nomes repetidos; as casas da conta so
+        # preenchem nomes que o publico nao tem (casas personalizadas).
+        for bookmaker_id, name in [*public_entries, *account_entries]:
+            normalized = _normalize_text(name)
+            if normalized and normalized not in by_name:
+                by_name[normalized] = bookmaker_id
+        self._bookmakers_by_name = by_name
+        self._bookmaker_ids = {bookmaker_id for bookmaker_id, _ in [*public_entries, *account_entries]}
+        self._bookmakers_loaded_at = time.monotonic()
+        logger.info(
+            "Catalogo de casas carregado: %s publicas, %s da conta, %s nomes unicos.",
+            len(public_entries),
+            len(account_entries),
+            len(by_name),
+        )
+
+    def _load_account_bookmaker_entries(self) -> list[tuple[int, str]]:
+        """Casas vinculadas a conta de destino; falhas nao bloqueiam o catalogo publico."""
+
+        if not (self._access_token or (self._settings.bet_analytix_email and self._settings.bet_analytix_password)):
+            return []
+        try:
+            self._ensure_authenticated()
+            user_id = self._resolve_destination_user_id()
+            all_data = self._request_json("GET", f"/bankroll/all-data/{user_id}", authenticated=True)
+        except Exception as exc:
+            logger.warning("Nao foi possivel carregar as casas da conta no Bet-Analytix: %s", exc)
+            return []
+        return _extract_bookmaker_entries(all_data, only_bookmaker_keys=True)
 
     def _ensure_authenticated(self) -> None:
         if self._access_token:
@@ -630,8 +726,48 @@ class BetAnalytixWriter:
         self._load_bookmakers()
 
         bookmaker_id_from_text = _bookmaker_id_from_text(bookmaker_name)
-        if bookmaker_id_from_text is not None and bookmaker_id_from_text in (self._bookmaker_ids or set()):
+        if bookmaker_id_from_text is not None:
+            # "id N" e uma escolha explicita do usuario: vale mesmo que a casa
+            # nao apareca no catalogo carregado (ex.: casa personalizada).
+            if bookmaker_id_from_text not in (self._bookmaker_ids or set()):
+                logger.warning(
+                    "Usando id de casa informado manualmente fora do catalogo: %s.",
+                    bookmaker_id_from_text,
+                )
             return bookmaker_id_from_text
+
+        resolved = self._match_bookmaker_name(bookmaker_name)
+        if resolved is not None:
+            return resolved
+
+        # Casa nova ou criada depois do start: recarrega o catalogo (no maximo
+        # 1x por minuto) antes de desistir.
+        if time.monotonic() - self._bookmakers_loaded_at >= BOOKMAKER_CATALOG_REFRESH_SECONDS:
+            logger.info("Casa '%s' nao encontrada; recarregando catalogo de casas.", bookmaker_name)
+            self._load_bookmakers(refresh=True)
+            resolved = self._match_bookmaker_name(bookmaker_name)
+            if resolved is not None:
+                return resolved
+
+        normalized_input = _normalize_text(bookmaker_name)
+        closest = process.extract(
+            normalized_input,
+            list((self._bookmakers_by_name or {}).keys()),
+            scorer=fuzz.ratio,
+            limit=3,
+        )
+        logger.warning(
+            "Casa nao encontrada: entrada=%r normalizada=%r catalogo=%s nomes; mais proximas=%s",
+            bookmaker_name,
+            normalized_input,
+            len(self._bookmakers_by_name or {}),
+            [(name, round(score)) for name, score, _ in closest],
+        )
+        raise BetAnalytixWriterError(f"Casa não encontrada no catálogo do Bet-Analytix: {bookmaker_name}")
+
+    def _match_bookmaker_name(self, bookmaker_name: str) -> int | None:
+        if not self._bookmakers_by_name:
+            return None
 
         normalized_input = _normalize_text(bookmaker_name)
         bookmaker_id = self._bookmakers_by_name.get(normalized_input)
@@ -642,11 +778,7 @@ class BetAnalytixWriter:
         if bet_variant_id is not None:
             return bet_variant_id
 
-        fuzzy_id = self._resolve_bookmaker_id_fuzzy(bookmaker_name, normalized_input)
-        if fuzzy_id is not None:
-            return fuzzy_id
-
-        raise BetAnalytixWriterError(f"Casa não encontrada no catálogo do Bet-Analytix: {bookmaker_name}")
+        return self._resolve_bookmaker_id_fuzzy(bookmaker_name, normalized_input)
 
     def _resolve_bookmaker_id_bet_variant(self, bookmaker_name: str, normalized_input: str) -> int | None:
         """Tenta equivalencia exata adicionando ou removendo o sufixo ``bet``."""
@@ -1182,6 +1314,64 @@ def _normalize_text(value: str) -> str:
     return "".join(char for char in without_marks if char.isalnum())
 
 
+def _extract_bookmaker_entries(payload: Any, only_bookmaker_keys: bool = False) -> list[tuple[int, str]]:
+    """Extrai pares (id, nome) de casas de um payload do Bet-Analytix.
+
+    Aceita a lista publica (`[{id, name}]`) e o `all-data` da conta, onde as
+    casas ficam em chaves que contem "bookmaker" (ex.: `bookmakers`,
+    `userBookmakers`), em itens planos ou com a casa aninhada.
+    """
+
+    entries: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+
+    def add_item(item: Any) -> None:
+        if not isinstance(item, dict):
+            return
+        nested = item.get("bookmaker")
+        if isinstance(nested, dict):
+            add_item(nested)
+            return
+        bookmaker_id = to_int(
+            nested
+            if nested is not None and to_int(nested) is not None
+            else item.get("id_bookmaker")
+            if item.get("id_bookmaker") is not None
+            else item.get("bookmaker_id")
+            if item.get("bookmaker_id") is not None
+            else item.get("idBookmaker")
+            if item.get("idBookmaker") is not None
+            else item.get("id")
+        )
+        name = item.get("name") or item.get("bookmaker_name") or item.get("label")
+        if bookmaker_id is None or not name:
+            return
+        key = (bookmaker_id, str(name))
+        if key not in seen:
+            seen.add(key)
+            entries.append(key)
+
+    def walk(value: Any, depth: int, in_bookmaker_key: bool) -> None:
+        if depth > 3:
+            return
+        if isinstance(value, list):
+            for item in value:
+                if in_bookmaker_key:
+                    add_item(item)
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                is_bookmaker_key = "bookmaker" in str(key).lower()
+                walk(child, depth + 1, is_bookmaker_key)
+
+    if isinstance(payload, list):
+        for item in payload:
+            add_item(item)
+    elif isinstance(payload, dict):
+        walk(payload, 0, not only_bookmaker_keys)
+    return entries
+
+
 def _bookmaker_id_from_text(value: str) -> int | None:
     cleaned = value.strip()
     if cleaned.lower().startswith("id "):
@@ -1246,6 +1436,16 @@ def _same_decimal(value: Any, expected: float, tolerance: float) -> bool:
     except (TypeError, ValueError):
         return False
     return abs(parsed - expected) <= tolerance
+
+
+def _competition_value(tip: ParsedTelegramTip) -> str | None:
+    league = (tip.league or "").strip()
+    return league or None
+
+
+def _is_client_error(exc: Exception) -> bool:
+    text = str(exc)
+    return any(f"HTTP {code}" in text for code in (400, 409, 422))
 
 
 def _build_note(tip: ParsedTelegramTip) -> str:

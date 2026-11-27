@@ -188,6 +188,19 @@ class DiscordSignalStore:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS discord_stake_prompts (
+                    dm_message_id INTEGER PRIMARY KEY,
+                    job_id INTEGER NOT NULL,
+                    source_bet_id INTEGER NOT NULL,
+                    bet_analytix_bet_id INTEGER NOT NULL,
+                    created_at_ts INTEGER NOT NULL,
+                    adjusted_stake REAL,
+                    adjusted_at_ts INTEGER
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS bet_states (
                     bet_id INTEGER PRIMARY KEY,
                     state INTEGER NOT NULL,
@@ -284,6 +297,61 @@ class DiscordSignalStore:
                 )
                 """
             )
+
+    def record_stake_prompt(
+        self,
+        dm_message_id: int,
+        job_id: int,
+        source_bet_id: int,
+        bet_analytix_bet_id: int,
+    ) -> None:
+        """Liga a DM de confirmacao a aposta, para aceitar resposta com nova stake."""
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO discord_stake_prompts (
+                    dm_message_id, job_id, source_bet_id, bet_analytix_bet_id, created_at_ts
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (int(dm_message_id), int(job_id), int(source_bet_id), int(bet_analytix_bet_id), int(time.time())),
+            )
+
+    def get_stake_prompt(self, dm_message_id: int) -> sqlite3.Row | None:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT p.*, j.payload_json, j.raw_message
+                FROM discord_stake_prompts AS p
+                LEFT JOIN discord_signal_jobs AS j ON j.id = p.job_id
+                WHERE p.dm_message_id = ?
+                """,
+                (int(dm_message_id),),
+            ).fetchone()
+
+    def record_stake_adjustment(self, dm_message_id: int, job_id: int, stake: float) -> None:
+        """Guarda a nova stake no prompt e no payload do job (auditoria)."""
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE discord_stake_prompts
+                SET adjusted_stake = ?, adjusted_at_ts = ?
+                WHERE dm_message_id = ?
+                """,
+                (float(stake), int(time.time()), int(dm_message_id)),
+            )
+            row = connection.execute(
+                "SELECT payload_json FROM discord_signal_jobs WHERE id = ?",
+                (int(job_id),),
+            ).fetchone()
+            if row is not None and row["payload_json"]:
+                payload = json.loads(str(row["payload_json"]))
+                payload["stake"] = float(stake)
+                connection.execute(
+                    "UPDATE discord_signal_jobs SET payload_json = ? WHERE id = ?",
+                    (json.dumps(payload, ensure_ascii=False), int(job_id)),
+                )
 
     def enqueue_signal(
         self,

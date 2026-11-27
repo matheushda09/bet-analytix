@@ -30,6 +30,8 @@ class ExternalBetSignal:
     link: str | None
     raw_text: str
     event_datetime: datetime | None = None
+    league: str | None = None
+    usd_brl_rate: float | None = None
 
     def note(self, chat_id: str, message_id: int) -> str:
         """Monta o comentario limpo para a aposta no Bet-Analytix."""
@@ -49,6 +51,7 @@ MONEY_BAG = "\U0001F4B0"
 FREE_BUTTON = "\U0001F193"
 CRYSTAL_BALL = "\U0001F52E"
 CALENDAR = "\U0001F4C6"
+TROPHY = "\U0001F3C6"
 VARIATION_SELECTOR = "\ufe0f"
 
 # Valor monetario: "R$27,00", "27,00" ou o formato em dolar com o valor em
@@ -61,6 +64,12 @@ STAKE_VALUE = (
     rf"|{MONEY_NUMBER}"
 )
 BRL_AMOUNT_PATTERN = re.compile(rf"R\$\s*(?P<value>{MONEY_NUMBER})", re.IGNORECASE)
+USD_BRL_PAIR_PATTERN = re.compile(
+    rf"(?:US\$|U\$|\$)\s*(?P<usd>{MONEY_NUMBER})\s*\(\s*R\$\s*(?P<brl>{MONEY_NUMBER})\s*\)",
+    re.IGNORECASE,
+)
+# "🏆 Liga Europa". Usa [ \t]* para um 🏆 vazio nao capturar a linha seguinte.
+LEAGUE_PATTERN = re.compile(rf"^[ \t]*{re.escape(TROPHY)}{VARIATION_SELECTOR}?[ \t]*(?P<value>[^\n\r]*)$", re.MULTILINE)
 
 PATTERNS: dict[str, re.Pattern[str]] = {
     "bookmaker": re.compile(rf"^\s*{re.escape(HOUSE)}\s*(?P<value>[^\n\r]+)", re.MULTILINE),
@@ -162,7 +171,49 @@ def parse_external_signal(
         link=None,
         raw_text=text,
         event_datetime=_parse_event_datetime(text),
+        league=_parse_league(text),
+        usd_brl_rate=_usd_brl_rate(header),
     )
+
+
+def _parse_league(text: str) -> str | None:
+    """Campeonato: linha 🏆 ou, no layout sem emojis, a linha apos a data.
+
+    No layout sem emojis o campeonato so e aceito quando vem logo depois da
+    linha de data/hora que segue o ADM, para nao confundir com comentarios.
+    """
+
+    match = LEAGUE_PATTERN.search(text)
+    if match:
+        value = " ".join(match.group("value").split())
+        return value or None
+
+    lines = text.splitlines()
+    admin_index = _line_index(lines, PATTERNS["admin"])
+    if admin_index is None or admin_index + 2 >= len(lines):
+        return None
+    if not PATTERNS["event_datetime"].fullmatch(lines[admin_index + 1]):
+        return None
+    candidate = " ".join(lines[admin_index + 2].split())
+    if not candidate or len(candidate) > 60 or not _looks_like_overload_value(candidate):
+        return None
+    if candidate.casefold().startswith(("ja temos", "já temos")):
+        return None
+    return candidate
+
+
+def _usd_brl_rate(header: str) -> float | None:
+    """Cotacao implicita do sinal (R$ / US$), usada para converter respostas em dolar."""
+
+    for match in USD_BRL_PAIR_PATTERN.finditer(header):
+        try:
+            usd = _parse_money(match.group("usd"))
+            brl = _parse_money(match.group("brl"))
+        except UserbotSignalParseError:
+            continue
+        if usd > 0 and brl > 0:
+            return round(brl / usd, 4)
+    return None
 
 
 def _resolve_bookmaker_alias(bookmaker: str, aliases: dict[str, str]) -> str:

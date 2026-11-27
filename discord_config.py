@@ -31,6 +31,9 @@ class DiscordReactionSettings:
     notify_chat_id: str | None
     notify_dm_on_success: bool
     bookmaker_aliases: dict[str, str]
+    # Cotacao fixa USD->BRL para respostas de stake em dolar sem cotacao no
+    # sinal. Vazio = consulta online (AwesomeAPI) com cache.
+    usd_brl_rate: float | None = None
 
 
 def load_discord_reaction_settings(env_path: str | Path = ".env") -> DiscordReactionSettings:
@@ -54,6 +57,7 @@ def load_discord_reaction_settings(env_path: str | Path = ".env") -> DiscordReac
         notify_chat_id=_get_optional_str("DISCORD_NOTIFY_CHAT_ID") or _get_optional_str("TELEGRAM_ADMIN_USER_ID"),
         notify_dm_on_success=_get_bool("DISCORD_NOTIFY_DM_ON_SUCCESS", True),
         bookmaker_aliases=_load_string_map("DISCORD_BOOKMAKER_ALIASES_JSON"),
+        usd_brl_rate=_get_float("DISCORD_USD_BRL_RATE", 0.0) or None,
     )
 
 

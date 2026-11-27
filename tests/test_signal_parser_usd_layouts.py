@@ -308,6 +308,22 @@ class UsdLayoutTests(unittest.TestCase):
                 for field, value in expected.items():
                     self.assertEqual(getattr(signal, field), value, field)
 
+    def test_league_and_signal_exchange_rate(self) -> None:
+        cases = (
+            (FISHBOT_USD_SIGNAL, "Liga Europa", 5.8825),
+            (FISHBOT_UNKNOWN_LIMIT_SIGNAL, "NCAA", 5.8824),
+            (CRYSTAL_BALL_EMPTY_DATE_SIGNAL, None, 5.8824),
+            (CRYSTAL_BALL_WITH_DATE_SIGNAL, None, 5.8824),
+            (PLAIN_CONVERGENT_SIGNAL, "NFL", 5.8825),
+            (PLAIN_FINTA_SIGNAL, None, 5.8824),
+            (OVERLOAD_BRL_SIGNAL, None, None),
+        )
+        for text, league, rate in cases:
+            with self.subTest(first_line=text.splitlines()[0], pick=text.splitlines()[3]):
+                signal = self._parse(text)
+                self.assertEqual(signal.league, league)
+                self.assertEqual(signal.usd_brl_rate, rate)
+
     def test_large_brl_stake_with_thousands_separator(self) -> None:
         text = FISHBOT_USD_SIGNAL.replace("US$4,59 (R$27,00)", "US$212,49 (R$1.250,00)")
 
