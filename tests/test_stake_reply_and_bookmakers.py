@@ -513,3 +513,53 @@ class AwaitingBookmakerRequeueTests(unittest.TestCase):
             self.assertEqual(store.get_job_by_message(1, 2, 3)["status"], "retry")
             self.assertEqual(store.get_job_by_message(1, 2, 4)["status"], "failed")
             self.assertEqual(store.get_jobs_awaiting_bookmaker(), [])
+
+
+class CompetitionRobustnessTests(unittest.TestCase):
+    def _writer(self, competitions, visible_after_lookups=0):
+        writer = object.__new__(BetAnalytixWriter)
+        writer._destination_user_id = 690942
+        state = {"lookups_after_create": 0, "created": False, "posts": 0}
+
+        def fake_request(method, path, json_payload=None, authenticated=False, **_kwargs):
+            if method == "GET":
+                listing = list(competitions)
+                if state["created"]:
+                    state["lookups_after_create"] += 1
+                    if state["lookups_after_create"] <= visible_after_lookups:
+                        listing = [item for item in listing if item["id"] != 900]
+                return {"competitions": listing}
+            if method == "POST":
+                state["posts"] += 1
+                state["created"] = True
+                competitions.append({"id": 900, "label": json_payload["label"], "sport": json_payload["sport"]})
+                return None
+            raise AssertionError((method, path))
+
+        writer._request_json = fake_request
+        writer.state = state
+        return writer
+
+    def test_waits_for_new_competition_to_show_up(self) -> None:
+        writer = self._writer([], visible_after_lookups=2)
+        with mock.patch("bet_analytix_writer.time.sleep") as sleep:
+            self.assertEqual(writer._resolve_competition_id_safely("Bundesliga", 1), 900)
+        self.assertEqual(writer.state["posts"], 1)
+        self.assertGreaterEqual(sleep.call_count, 1)
+
+    def test_never_creates_twice_and_retries_after_interval(self) -> None:
+        writer = self._writer([], visible_after_lookups=99)
+        with mock.patch("bet_analytix_writer.time.sleep"):
+            self.assertIsNone(writer._resolve_competition_id_safely("Bundesliga", 1))
+            # dentro do intervalo: nem tenta
+            self.assertIsNone(writer._resolve_competition_id_safely("Bundesliga", 1))
+            writer.state["created"] = False  # agora o campeonato aparece na listagem
+            for key in list(writer._competition_failure_times):
+                writer._competition_failure_times[key] -= 3600
+            self.assertEqual(writer._resolve_competition_id_safely("Bundesliga", 1), 900)
+        self.assertEqual(writer.state["posts"], 1)
+
+    def test_same_label_other_sport_is_reused(self) -> None:
+        writer = self._writer([{"id": 77, "label": "Bundesliga", "sport": None}])
+        self.assertEqual(writer._resolve_competition_id_safely("Bundesliga", 1), 77)
+        self.assertEqual(writer.state["posts"], 0)

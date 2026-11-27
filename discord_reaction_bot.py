@@ -994,7 +994,15 @@ class DiscordSignalClient(discord.Client):
                 f"Evento: {tip.event}",
             ]
             if tip.league:
-                lines.append(f"Campeonato: {tip.league}")
+                applied = None
+                applied_lookup = getattr(self._writer, "competition_applied", None)
+                if callable(applied_lookup) and not already_exists:
+                    try:
+                        applied = applied_lookup(tip.source_bet_id)
+                    except Exception:
+                        applied = None
+                suffix = " ⚠️ (não aplicado no Bet-Analytix)" if applied is False else ""
+                lines.append(f"Campeonato: {tip.league}{suffix}")
             lines.append(
                 f"Data/hora: {_format_local_datetime(tip.event_datetime, self._base_settings.timezone)}"
             )

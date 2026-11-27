@@ -28,6 +28,10 @@ BOOKMAKER_FUZZY_MATCH_THRESHOLD = int(os.getenv("BOOKMAKER_FUZZY_MATCH_THRESHOLD
 BOOKMAKER_CATALOG_REFRESH_SECONDS = float(os.getenv("BOOKMAKER_CATALOG_REFRESH_SECONDS", "60"))
 # Idade maxima do catalogo antes de renovar mesmo sem falha (casas novas).
 BOOKMAKER_CATALOG_MAX_AGE_SECONDS = float(os.getenv("BOOKMAKER_CATALOG_MAX_AGE_SECONDS", "21600"))
+# Campeonato nao resolvido: nova tentativa depois deste intervalo.
+COMPETITION_RETRY_SECONDS = float(os.getenv("COMPETITION_RETRY_SECONDS", "300"))
+# Esperas para o campeonato recem-criado aparecer na listagem da conta.
+COMPETITION_LOOKUP_DELAYS = (1.0, 2.0, 4.0)
 
 _DOMAIN_SUFFIXES = (
     ".com.br", ".bet.br", ".net.br", ".com", ".bet", ".net", ".org", ".io",
@@ -67,7 +71,8 @@ class BetAnalytixWriter:
         self._destination_user_id: int | None = None
         self._destination_tipsters_by_name: dict[str, int] | None = None
         self._competition_ids: dict[tuple[str, int | None], int] = {}
-        self._competition_failures: set[tuple[str, int | None]] = set()
+        self._competition_failure_times: dict[tuple[str, int | None], float] = {}
+        self._competition_results: dict[int, bool] = {}
 
     def create_bet(self, tip: ParsedTelegramTip) -> list[dict[str, Any]]:
         """Registra a tip parseada na bankroll de destino."""
@@ -86,6 +91,7 @@ class BetAnalytixWriter:
         sport_id = self._resolve_sport_id(tip.sport)
         tipster_id = self._resolve_destination_tipster_id(tip.tipster)
         competition_id = self._resolve_competition_id_safely(tip.league, sport_id)
+        self._record_competition_result(tip, competition_id)
         event_date, event_time = self._bet_analytix_datetime_fields(tip.event_datetime)
         existing_bet_id = self.find_existing_matching_copytrade_bet(
             tip=tip,
@@ -172,6 +178,7 @@ class BetAnalytixWriter:
         sport_id = self._resolve_sport_id(tip.sport)
         tipster_id = self._resolve_destination_tipster_id(tip.tipster)
         competition_id = self._resolve_competition_id_safely(tip.league, sport_id)
+        self._record_competition_result(tip, competition_id)
         event_date, event_time = self._bet_analytix_datetime_fields(tip.event_datetime)
         existing_bet_id = self.find_existing_matching_copytrade_bet(
             tip=tip,
@@ -1168,6 +1175,21 @@ class BetAnalytixWriter:
         self._destination_user_id = user_id
         return user_id
 
+    def competition_applied(self, source_bet_id: int) -> bool | None:
+        """True/False se o campeonato da aposta foi aplicado; None se nao se aplica."""
+
+        return getattr(self, "_competition_results", {}).get(int(source_bet_id))
+
+    def _record_competition_result(self, tip: ParsedTelegramTip, competition_id: int | None) -> None:
+        if not (tip.league or "").strip():
+            return
+        results = getattr(self, "_competition_results", None)
+        if results is None:
+            results = self._competition_results = {}
+        if len(results) > 1000:
+            results.clear()
+        results[int(tip.source_bet_id)] = competition_id is not None
+
     def _resolve_competition_id_safely(self, league: str | None, sport_id: int | None) -> int | None:
         """ID da competicao (campeonato) da conta; cria se nao existir.
 
@@ -1179,9 +1201,12 @@ class BetAnalytixWriter:
         label = " ".join(str(league or "").split())
         if not label:
             return None
-        failures = getattr(self, "_competition_failures", set())
         key = (_normalize_text(label), sport_id)
-        if key in failures:
+        failures = getattr(self, "_competition_failure_times", None)
+        if failures is None:
+            failures = self._competition_failure_times = {}
+        failed_at = failures.get(key)
+        if failed_at is not None and time.monotonic() - failed_at < COMPETITION_RETRY_SECONDS:
             return None
         try:
             competition_id = self._resolve_competition_id(label, sport_id)
@@ -1189,8 +1214,10 @@ class BetAnalytixWriter:
             logger.warning("Campeonato '%s' nao resolvido; aposta seguira sem campeonato: %s", label, exc)
             competition_id = None
         if competition_id is None:
-            failures.add(key)
-            self._competition_failures = failures
+            failures[key] = time.monotonic()
+            logger.warning("Campeonato '%s' (sport=%s) nao aplicado nesta aposta.", label, sport_id)
+        else:
+            failures.pop(key, None)
         return competition_id
 
     def _resolve_competition_id(self, label: str, sport_id: int | None) -> int | None:
@@ -1203,14 +1230,32 @@ class BetAnalytixWriter:
 
         found = self._find_competition_id(label, sport_id)
         if found is None:
-            logger.info("Criando campeonato '%s' (sport=%s) no Bet-Analytix.", label, sport_id)
-            self._request_json(
-                "POST",
-                "/competition",
-                json_payload={"label": label, "sport": sport_id, "country": None},
-                authenticated=True,
-            )
-            found = self._find_competition_id(label, sport_id)
+            created = getattr(self, "_competition_created_times", None)
+            if created is None:
+                created = self._competition_created_times = {}
+            created_at = created.get(key)
+            # Nunca cria o mesmo campeonato duas vezes seguidas: se ja foi
+            # criado ha pouco e ainda nao aparece, so volta a procurar.
+            if created_at is None or time.monotonic() - created_at > 3600:
+                logger.info("Criando campeonato '%s' (sport=%s) no Bet-Analytix.", label, sport_id)
+                response = self._request_json(
+                    "POST",
+                    "/competition",
+                    json_payload={"label": label, "sport": sport_id, "country": None},
+                    authenticated=True,
+                )
+                created[key] = time.monotonic()
+                response_item = response[0] if isinstance(response, list) and response else response
+                if isinstance(response_item, dict) and to_int(response_item.get("id")) is not None:
+                    found = to_int(response_item.get("id"))
+            # A API responde so "OK" ao criar: o novo ID pode demorar a
+            # aparecer na listagem.
+            for delay in (0.0, *COMPETITION_LOOKUP_DELAYS):
+                if found is not None:
+                    break
+                if delay:
+                    time.sleep(delay)
+                found = self._find_competition_id(label, sport_id)
         if found is not None:
             cache[key] = found
         return found
@@ -1232,6 +1277,12 @@ class BetAnalytixWriter:
         for item in same_label:
             if sport_id is None or to_int(item.get("sport")) == sport_id:
                 return to_int(item.get("id"))
+        # Mesmo nome com outro esporte (ou sem esporte) ainda e melhor que nada
+        # e evita criar duplicado.
+        for item in same_label:
+            competition_id = to_int(item.get("id"))
+            if competition_id is not None:
+                return competition_id
         return None
 
     def _create_tipster(self, tipster_name: str) -> None:
