@@ -7,6 +7,9 @@ Regras de moeda:
 
 Tolera espacos e a moeda antes ou depois do numero: "R$43", "R$   43",
 "$ 41", "41$", "r41", "41 reais", "1.250,00", "43.5".
+
+Opcionalmente a odd pega pode vir junto com "@" ou "odd":
+"R$43 @2.05", "$8 @ 1,95", "43 odd 2.1".
 """
 
 from __future__ import annotations
@@ -51,6 +54,10 @@ class StakeReplyError(ValueError):
 class StakeReply:
     amount: float
     currency: str
+    odd: float | None = None
+
+
+_ODD_PATTERN = re.compile(r"(?:@|\bodds?\b)\s*(?P<odd>\d+(?:[.,]\d+)?)\s*$")
 
 
 def parse_stake_reply(text: str) -> StakeReply:
@@ -59,6 +66,13 @@ def parse_stake_reply(text: str) -> StakeReply:
     normalized = _strip_accents(str(text or "")).casefold().strip()
     # Remove formatacao comum do Discord e pontuacao final.
     normalized = normalized.replace("*", "").replace("`", "").replace("_", " ").strip(" .!")
+    odd: float | None = None
+    odd_match = _ODD_PATTERN.search(normalized)
+    if odd_match:
+        odd = float(odd_match.group("odd").replace(",", "."))
+        if not 1.01 <= odd <= 1000:
+            raise StakeReplyError("odd invalida; use por exemplo @2.05")
+        normalized = normalized[: odd_match.start()].strip()
     numbers = _NUMBER_PATTERN.findall(normalized)
     if len(numbers) != 1:
         raise StakeReplyError("envie um unico valor, ex.: R$43 ou $8")
@@ -81,7 +95,7 @@ def parse_stake_reply(text: str) -> StakeReply:
     amount = _parse_number(number_text)
     if amount <= 0:
         raise StakeReplyError("o valor precisa ser maior que zero")
-    return StakeReply(amount=amount, currency=currency)
+    return StakeReply(amount=amount, currency=currency, odd=odd)
 
 
 def _parse_number(value: str) -> float:

@@ -82,6 +82,14 @@ RENAN_COPYTRADE_DESTINATION_TIPSTER_NAME=Renan
 RENAN_DISCORD_BOOKMAKER_ALIASES_JSON={}
 # Opcional: cotacao fixa USD->BRL para respostas de stake em dolar (vazio = cotacao do sinal ou online)
 RENAN_DISCORD_USD_BRL_RATE=
+# Stake: fixo (R$ do sinal, padrao) | percentual (% do sinal x sua banca) | multiplicador
+RENAN_DISCORD_STAKE_MODE=fixo
+RENAN_DISCORD_STAKE_MULTIPLIER=1
+# Filtros opcionais (vazio = desligado). Ex.: 99play,Stake,BetOnline e 2 (EV minimo em %)
+RENAN_DISCORD_ALLOWED_BOOKMAKERS=
+RENAN_DISCORD_MIN_EV_PERCENT=
+# avisar (planilha e avisa na DM) | bloquear (nao planilha)
+RENAN_DISCORD_FILTER_MODE=avisar
 
 # Instância TARIK
 TARIK_SERVICE_TYPE=discord
@@ -102,3 +110,11 @@ TARIK_COPYTRADE_DESTINATION_TIPSTER_NAME=Tarik
 TARIK_DISCORD_BOOKMAKER_ALIASES_JSON={}
 # Opcional: cotacao fixa USD->BRL para respostas de stake em dolar (vazio = cotacao do sinal ou online)
 TARIK_DISCORD_USD_BRL_RATE=
+# Stake: fixo (R$ do sinal, padrao) | percentual (% do sinal x sua banca) | multiplicador
+TARIK_DISCORD_STAKE_MODE=fixo
+TARIK_DISCORD_STAKE_MULTIPLIER=1
+# Filtros opcionais (vazio = desligado). Ex.: 99play,Stake,BetOnline e 2 (EV minimo em %)
+TARIK_DISCORD_ALLOWED_BOOKMAKERS=
+TARIK_DISCORD_MIN_EV_PERCENT=
+# avisar (planilha e avisa na DM) | bloquear (nao planilha)
+TARIK_DISCORD_FILTER_MODE=avisar

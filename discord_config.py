@@ -34,6 +34,15 @@ class DiscordReactionSettings:
     # Cotacao fixa USD->BRL para respostas de stake em dolar sem cotacao no
     # sinal. Vazio = consulta online (AwesomeAPI) com cache.
     usd_brl_rate: float | None = None
+    # Stake: "fixo" (R$ do sinal), "percentual" (% do sinal x banca do
+    # usuario) ou "multiplicador" (R$ do sinal x DISCORD_STAKE_MULTIPLIER).
+    stake_mode: str = "fixo"
+    stake_multiplier: float = 1.0
+    # Filtros opcionais. Vazio/None = desligado.
+    allowed_bookmakers: tuple[str, ...] = ()
+    min_ev_percent: float | None = None
+    # "avisar" (planilha e avisa na DM) ou "bloquear" (nao planilha).
+    filter_mode: str = "avisar"
 
 
 def load_discord_reaction_settings(env_path: str | Path = ".env") -> DiscordReactionSettings:
@@ -58,7 +67,27 @@ def load_discord_reaction_settings(env_path: str | Path = ".env") -> DiscordReac
         notify_dm_on_success=_get_bool("DISCORD_NOTIFY_DM_ON_SUCCESS", True),
         bookmaker_aliases=_load_string_map("DISCORD_BOOKMAKER_ALIASES_JSON"),
         usd_brl_rate=_get_float("DISCORD_USD_BRL_RATE", 0.0) or None,
+        stake_mode=_get_choice("DISCORD_STAKE_MODE", "fixo", {"fixo", "percentual", "multiplicador"}),
+        stake_multiplier=_get_float("DISCORD_STAKE_MULTIPLIER", 1.0),
+        allowed_bookmakers=tuple(
+            name.strip()
+            for name in (_get_optional_str("DISCORD_ALLOWED_BOOKMAKERS") or "").split(",")
+            if name.strip()
+        ),
+        min_ev_percent=(
+            _get_float("DISCORD_MIN_EV_PERCENT", 0.0)
+            if _get_optional_str("DISCORD_MIN_EV_PERCENT") is not None
+            else None
+        ),
+        filter_mode=_get_choice("DISCORD_FILTER_MODE", "avisar", {"avisar", "bloquear"}),
     )
+
+
+def _get_choice(name: str, default: str, choices: set[str]) -> str:
+    value = (_get_optional_str(name) or default).strip().lower()
+    if value not in choices:
+        raise RuntimeError(f"Variavel {name} invalida: {value}. Use uma de: {', '.join(sorted(choices))}")
+    return value
 
 
 def validate_discord_reaction_settings(settings: DiscordReactionSettings) -> None:

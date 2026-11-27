@@ -189,15 +189,20 @@ def _parse_league(text: str) -> str | None:
         return value or None
 
     lines = text.splitlines()
+    if not lines or not _is_positional_header(text):
+        return None
     admin_index = _line_index(lines, PATTERNS["admin"])
-    if admin_index is None or admin_index + 2 >= len(lines):
+    if admin_index is None or admin_index + 1 >= len(lines):
         return None
-    if not PATTERNS["event_datetime"].fullmatch(lines[admin_index + 1]):
+    candidate_index = admin_index + 1
+    if PATTERNS["event_datetime"].fullmatch(lines[candidate_index]):
+        candidate_index += 1
+    if candidate_index >= len(lines):
         return None
-    candidate = " ".join(lines[admin_index + 2].split())
-    if not candidate or len(candidate) > 60 or not _looks_like_overload_value(candidate):
+    candidate = " ".join(lines[candidate_index].split())
+    if not candidate or len(candidate) > 50 or not _looks_like_overload_value(candidate):
         return None
-    if candidate.casefold().startswith(("ja temos", "já temos")):
+    if any(char in candidate for char in "?!@:") or candidate.casefold().startswith(("ja temos", "já temos")):
         return None
     return candidate
 

@@ -43,6 +43,17 @@ from userbot_signal_parser import (
     parse_external_signal,
 )
 from userbot_telegram_notifier import UserbotTelegramNotifier
+from discord_signal_policy import (
+    FILTER_MODE_BLOCK,
+    STAKE_MODE_PERCENT,
+    compute_stake,
+    event_started,
+    filter_reasons,
+    is_accumulator_event,
+    is_probably_truncated_pick,
+    selection_key,
+)
+from ev_report import build_ev_stats, format_ev_report
 from stake_reply import (
     USD,
     StakeReplyError,
@@ -117,6 +128,9 @@ class DiscordSignalClient(discord.Client):
         self._peixeesperto_scheduler_task: asyncio.Task[None] | None = None
         self._sports_event_recheck_task: asyncio.Task[None] | None = None
         self._usd_brl_rate_provider = UsdBrlRateProvider(fixed_rate=discord_settings.usd_brl_rate)
+        # Observacoes da hora da reacao (modo de stake, filtros) exibidas na DM.
+        self._dm_notes: dict[int, list[str]] = {}
+        self._bankroll_capital_cache: tuple[float, float] | None = None
 
     async def setup_hook(self) -> None:
         """Inicializa tarefas de fundo depois que o cliente esta pronto."""
@@ -258,6 +272,7 @@ class DiscordSignalClient(discord.Client):
                     bet_analytix_bet_id=created_id,
                     already_exists=_response_already_exists(response),
                     job_id=job_id,
+                    raw_message=str(job["raw_message"] or ""),
                 )
                 await self._notify_success(
                     tip=tip,
@@ -311,6 +326,11 @@ class DiscordSignalClient(discord.Client):
         if message.author.bot:
             return
         if not message.content:
+            return
+
+        first_word = message.content.strip().split(maxsplit=1)[0].lower()
+        if first_word == "!ev":
+            await self._send_ev_report(message)
             return
 
         # Comandos de bankroll podem vir por DM ou no canal monitorado.
@@ -401,7 +421,10 @@ class DiscordSignalClient(discord.Client):
             return
 
         try:
-            await asyncio.to_thread(self._writer.update_bet_stake, bet_id, stake_brl)
+            if reply.odd is not None:
+                await asyncio.to_thread(self._writer.update_bet_odd_stake, bet_id, reply.odd, stake_brl)
+            else:
+                await asyncio.to_thread(self._writer.update_bet_stake, bet_id, stake_brl)
         except Exception as exc:
             logger.exception("Falha ao atualizar stake bet_id=%s.", bet_id)
             await self._safe_dm_reply(
@@ -429,10 +452,95 @@ class DiscordSignalClient(discord.Client):
             reply.currency,
             rate,
         )
+        odd_text = f" e odd {reply.odd:.3f}" if reply.odd is not None else ""
         await self._safe_dm_reply(
             message,
-            f"✅ Stake atualizada para {_format_brl(stake_brl)}{conversion} no Bet-Analytix (ID {bet_id}).",
+            f"✅ Stake atualizada para {_format_brl(stake_brl)}{conversion}{odd_text} no Bet-Analytix (ID {bet_id}).",
         )
+
+    def _dm_warnings(self, tip: ParsedTelegramTip, job_id: int | None, raw_message: str) -> list[str]:
+        """Avisos calculados na hora da confirmacao (nao bloqueiam a aposta)."""
+
+        warnings: list[str] = []
+        signal = None
+        if raw_message:
+            try:
+                signal = parse_external_signal(raw_message, signal_marker_pattern=ODD_CHANGED_MARKER_PATTERN)
+            except UserbotSignalParseError:
+                signal = None
+
+        if signal is not None and event_started(signal.event_datetime, self._base_settings.timezone):
+            warnings.append(
+                "⏰ Atenção: o jogo já começou "
+                f"({_format_local_datetime(signal.event_datetime, self._base_settings.timezone)})."
+            )
+        if is_probably_truncated_pick(signal.pick if signal is not None else tip.pick):
+            warnings.append("✂️ Pick possivelmente cortado na mensagem original; confira no Bet-Analytix.")
+
+        try:
+            key = selection_key(tip.event, tip.pick)
+            previous = []
+            for row in self._store.list_done_jobs_since(int(time.time()) - 7 * 86400):
+                if job_id is not None and int(row["id"]) == int(job_id):
+                    continue
+                payload = json.loads(str(row["payload_json"]))
+                if selection_key(payload.get("event"), payload.get("pick")) == key:
+                    previous.append(payload)
+            if previous:
+                total = sum(float(item.get("stake") or 0) for item in previous) + tip.stake
+                details = ", ".join(
+                    f"{_format_brl(float(item.get('stake') or 0))} @{item.get('odd')}" for item in previous[-3:]
+                )
+                warnings.append(
+                    f"🔁 Você já planilhou esta seleção {len(previous)}x ({details}). "
+                    f"Exposição total agora: {_format_brl(total)}."
+                )
+        except Exception:
+            logger.exception("Falha ao checar selecao repetida para source_bet_id=%s.", tip.source_bet_id)
+        return warnings
+
+    async def _current_bankroll_capital(self) -> float | None:
+        """Capital atual da banca do usuario (cache de 10 min)."""
+
+        now = time.monotonic()
+        if self._bankroll_capital_cache and now - self._bankroll_capital_cache[1] < 600:
+            return self._bankroll_capital_cache[0]
+        try:
+            bankroll = await asyncio.to_thread(self._writer.fetch_bankroll_summary)
+            stats = (bankroll.get("stats_global") or {}).get("global") or {}
+            capital = float(stats.get("currentCapital"))
+        except Exception:
+            logger.exception("Nao foi possivel ler o capital da banca para stake percentual.")
+            return self._bankroll_capital_cache[0] if self._bankroll_capital_cache else None
+        if capital <= 0:
+            return None
+        self._bankroll_capital_cache = (capital, now)
+        return capital
+
+    async def _send_ev_report(self, message: discord.Message) -> None:
+        parts = message.content.strip().split()
+        days = 30
+        if len(parts) > 1:
+            try:
+                days = max(1, min(365, int(parts[1])))
+            except ValueError:
+                pass
+        rows = self._store.list_done_jobs_since(int(time.time()) - days * 86400)
+        text = format_ev_report(build_ev_stats(rows), days)
+        try:
+            for start in range(0, len(text), 1900):
+                await message.channel.send(text[start : start + 1900])
+        except Exception:
+            logger.exception("Falha ao enviar relatorio de EV.")
+
+    async def _send_admin_dm(self, text: str) -> None:
+        if self._settings.admin_user_id is None:
+            return
+        try:
+            user = await self.fetch_user(self._settings.admin_user_id)
+            await user.send(text)
+        except Exception:
+            logger.exception("Falha ao enviar DM ao admin.")
 
     async def _safe_dm_reply(self, message: discord.Message, text: str) -> None:
         try:
@@ -578,6 +686,45 @@ class DiscordSignalClient(discord.Client):
             return
 
         source_bet_id = build_source_bet_id(guild_id, channel_id, message_id)
+        dm_notes: list[str] = []
+
+        if not is_accumulator and is_accumulator_event(signal.event):
+            is_accumulator = True
+            dm_notes.append("Múltipla detectada pelo evento; planilhada como múltipla.")
+
+        reasons = filter_reasons(
+            source_bookmaker=signal.source_bookmaker,
+            resolved_bookmaker=signal.bookmaker,
+            odd=signal.odd,
+            fair_odd=signal.fair_odd,
+            allowed_bookmakers=self._settings.allowed_bookmakers,
+            min_ev_percent=self._settings.min_ev_percent,
+        )
+        if reasons and self._settings.filter_mode == FILTER_MODE_BLOCK:
+            logger.info("Discord sinal bloqueado por filtro: source_bet_id=%s motivos=%s", source_bet_id, reasons)
+            await self._send_admin_dm(
+                "🚫 Sinal NÃO planilhado pelos seus filtros:\n"
+                + "\n".join(f"• {reason}" for reason in reasons)
+                + f"\nEvento: {signal.event}\nPick: {signal.pick}\nOdd: {signal.odd}"
+            )
+            return
+        dm_notes.extend(f"⚠️ Filtro: {reason}" for reason in reasons)
+
+        bankroll_capital = None
+        if self._settings.stake_mode == STAKE_MODE_PERCENT:
+            bankroll_capital = await self._current_bankroll_capital()
+        stake_decision = compute_stake(
+            signal.stake,
+            signal.edge,
+            self._settings.stake_mode,
+            self._settings.stake_multiplier,
+            bankroll_capital,
+        )
+        if stake_decision.note:
+            dm_notes.append(f"Stake: {stake_decision.note} (sinal: {_format_brl(signal.stake)}).")
+        if dm_notes:
+            self._dm_notes[source_bet_id] = dm_notes
+
         fallback_datetime_utc = _message_datetime(message.created_at)
         sports_event_audit: dict[str, Any] | None = None
         if signal.event_datetime is not None:
@@ -667,7 +814,7 @@ class DiscordSignalClient(discord.Client):
             league=signal.league,
             pick=_pick_label(signal.event, signal.pick),
             odd=signal.odd,
-            stake=signal.stake,
+            stake=stake_decision.stake,
             bookmaker=signal.bookmaker,
             source_bet_id=source_bet_id,
             event=signal.event,
@@ -715,6 +862,7 @@ class DiscordSignalClient(discord.Client):
         bet_analytix_bet_id: int | None,
         already_exists: bool,
         job_id: int | None = None,
+        raw_message: str = "",
     ) -> None:
         """Envia DM no Discord para o admin confirmando a aposta planilhada."""
 
@@ -745,6 +893,11 @@ class DiscordSignalClient(discord.Client):
                     f"ID Bet-Analytix: {bet_analytix_bet_id or 'N/A'}",
                 ]
             )
+            warnings = self._dm_notes.pop(tip.source_bet_id, [])
+            warnings.extend(self._dm_warnings(tip, job_id, raw_message))
+            if warnings:
+                lines.append("")
+                lines.extend(warnings)
             can_adjust_stake = (
                 bet_analytix_bet_id is not None and job_id is not None and not tip.is_accumulator
             )
@@ -753,7 +906,7 @@ class DiscordSignalClient(discord.Client):
                     [
                         "",
                         "💬 Deseja colocar um valor diferente da stake? Responda a esta mensagem "
-                        "com o valor: R$43 (reais) ou $8 (dólares).",
+                        "com o valor: R$43 (reais) ou $8 (dólares). Se a odd mudou: R$43 @2.05",
                     ]
                 )
             sent = await user.send("\n".join(lines))

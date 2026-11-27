@@ -353,6 +353,23 @@ class DiscordSignalStore:
                     (json.dumps(payload, ensure_ascii=False), int(job_id)),
                 )
 
+    def list_done_jobs_since(self, since_ts: int) -> list[sqlite3.Row]:
+        """Jobs planilhados desde `since_ts`, com estado/lucro conhecido (se houver)."""
+
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT j.id, j.source_bet_id, j.payload_json, j.raw_message,
+                       j.source_tipster_name, j.bet_analytix_bet_id, j.created_at_ts,
+                       b.state AS bet_state, b.profit_cents AS bet_profit_cents
+                FROM discord_signal_jobs AS j
+                LEFT JOIN bet_states AS b ON b.bet_id = j.bet_analytix_bet_id
+                WHERE j.status = 'done' AND j.created_at_ts >= ?
+                ORDER BY j.created_at_ts
+                """,
+                (int(since_ts),),
+            ).fetchall()
+
     def enqueue_signal(
         self,
         guild_id: str | int,

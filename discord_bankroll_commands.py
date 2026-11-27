@@ -267,6 +267,7 @@ def _format_help_message(prefix: str) -> str:
         f"`{prefix} historico [dias]` — Lista movimentações recentes (padrão 7 dias).",
         f"`{prefix} relatorio` — Força sincronização e envia o relatório consolidado.",
         f"`{prefix} resetgreens` — Redefine o baseline para contar apenas greens marcados daqui pra frente.",
+        f"`!ev [dias]` — EV esperado x resultado real por ADM (padrão 30 dias).",
         f"`{prefix} ajuda` — Mostra esta mensagem.",
     ]
     return "\n".join(lines)
