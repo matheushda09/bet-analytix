@@ -940,6 +940,13 @@ class DiscordSignalClient(discord.Client):
                 logger.warning("Nao foi possivel encontrar usuario Discord admin=%s para DM.", self._settings.admin_user_id)
                 return
             status = "ja existia" if already_exists else "criada"
+            bookmaker_match = None
+            match_lookup = getattr(self._writer, "last_bookmaker_match", None)
+            if callable(match_lookup):
+                try:
+                    bookmaker_match = match_lookup(tip.bookmaker)
+                except Exception:
+                    bookmaker_match = None
             lines = [
                 f"✅ Aposta {status} no Bet-Analytix",
                 f"Tipster: {tip.tipster}",
@@ -955,10 +962,16 @@ class DiscordSignalClient(discord.Client):
                     f"Pick: {tip.pick}",
                     f"Odd: {tip.odd}",
                     f"Stake: {_format_brl(tip.stake)}",
-                    f"Bookmaker: {tip.bookmaker}",
+                    _bookmaker_line(tip.bookmaker, bookmaker_match),
                     f"ID Bet-Analytix: {bet_analytix_bet_id or 'N/A'}",
                 ]
             )
+            if bookmaker_match is not None and bookmaker_match.is_approximate:
+                lines.append(
+                    f"⚠️ Casa pareada por aproximação ({bookmaker_match.score:.0f}%): "
+                    f"'{tip.bookmaker}' → '{bookmaker_match.bookmaker_name}'. "
+                    "Se estiver errada, clique no ❌ e avise para cadastrarmos o alias."
+                )
             warnings = self._dm_notes.pop(tip.source_bet_id, [])
             warnings.extend(self._dm_warnings(tip, job_id, raw_message))
             if warnings:
@@ -1467,6 +1480,15 @@ def _writer_settings_for_discord(base_settings: Settings, discord_settings: Disc
         copytrade_destination_tipster_name=tipster_name,
         copytrade_destination_tipster_id=None,
     )
+
+
+def _bookmaker_line(signal_bookmaker: str, match: Any) -> str:
+    resolved = getattr(match, "bookmaker_name", None) if match is not None else None
+    if resolved and "".join(ch for ch in resolved.lower() if ch.isalnum()) != "".join(
+        ch for ch in signal_bookmaker.lower() if ch.isalnum()
+    ):
+        return f"Bookmaker: {signal_bookmaker} → {resolved}"
+    return f"Bookmaker: {resolved or signal_bookmaker}"
 
 
 def _format_brl(value: float) -> str:

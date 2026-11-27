@@ -7,6 +7,7 @@ import logging
 import os
 import time
 import unicodedata
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -25,6 +26,26 @@ logger = logging.getLogger(__name__)
 BOOKMAKER_FUZZY_MATCH_THRESHOLD = int(os.getenv("BOOKMAKER_FUZZY_MATCH_THRESHOLD", "80"))
 # Intervalo minimo entre recargas do catalogo quando uma casa nao e encontrada.
 BOOKMAKER_CATALOG_REFRESH_SECONDS = float(os.getenv("BOOKMAKER_CATALOG_REFRESH_SECONDS", "60"))
+# Idade maxima do catalogo antes de renovar mesmo sem falha (casas novas).
+BOOKMAKER_CATALOG_MAX_AGE_SECONDS = float(os.getenv("BOOKMAKER_CATALOG_MAX_AGE_SECONDS", "21600"))
+
+_DOMAIN_SUFFIXES = (
+    ".com.br", ".bet.br", ".net.br", ".com", ".bet", ".net", ".org", ".io",
+    ".me", ".ag", ".win", ".app", ".club", ".vip", ".games", ".casino", ".br",
+)
+
+
+@dataclass(frozen=True)
+class BookmakerMatch:
+    source_name: str
+    bookmaker_id: int
+    bookmaker_name: str
+    method: str
+    score: float
+
+    @property
+    def is_approximate(self) -> bool:
+        return self.method in {"fuzzy", "aproximado"}
 
 
 class BetAnalytixWriterError(RuntimeError):
@@ -729,6 +750,9 @@ class BetAnalytixWriter:
         public_entries = _extract_bookmaker_entries(payload)
         account_entries = self._load_account_bookmaker_entries()
 
+        self._bookmaker_display_names = {}
+        for bookmaker_id, name in [*account_entries, *public_entries]:
+            self._bookmaker_display_names[bookmaker_id] = str(name)
         by_name: dict[str, int] = {}
         # O catalogo publico manda em nomes repetidos; as casas da conta so
         # preenchem nomes que o publico nao tem (casas personalizadas).
@@ -780,62 +804,145 @@ class BetAnalytixWriter:
         logger.info("Login no Bet-Analytix realizado com sucesso.")
 
     def _resolve_bookmaker_id(self, bookmaker_name: str) -> int:
-        self._load_bookmakers()
+        return self.match_bookmaker(bookmaker_name).bookmaker_id
+
+    def match_bookmaker(self, bookmaker_name: str) -> "BookmakerMatch":
+        """Pareia a casa do sinal com o catalogo do Bet-Analytix. Sempre retorna.
+
+        Ordem: id explicito -> nome exato -> variacao com/sem "bet" -> fuzzy
+        conservador -> recarrega catalogo (casa nova) e tenta de novo ->
+        melhor aproximacao do catalogo (marcada como aproximada para a DM).
+        So falha se o catalogo nao puder ser carregado.
+        """
+
+        self._load_bookmakers_fresh()
 
         bookmaker_id_from_text = _bookmaker_id_from_text(bookmaker_name)
         if bookmaker_id_from_text is not None:
-            # "id N" e uma escolha explicita do usuario: vale mesmo que a casa
-            # nao apareca no catalogo carregado (ex.: casa personalizada).
             if bookmaker_id_from_text not in (self._bookmaker_ids or set()):
                 logger.warning(
                     "Usando id de casa informado manualmente fora do catalogo: %s.",
                     bookmaker_id_from_text,
                 )
-            return bookmaker_id_from_text
+            return self._remember_match(bookmaker_name, bookmaker_id_from_text, "id", 100.0)
 
-        resolved = self._match_bookmaker_name(bookmaker_name)
-        if resolved is not None:
-            return resolved
+        strict = self._strict_bookmaker_match(bookmaker_name)
+        if strict is not None:
+            return self._remember_match(bookmaker_name, *strict)
 
-        # Casa nova ou criada depois do start: recarrega o catalogo (no maximo
-        # 1x por minuto) antes de desistir.
-        if time.monotonic() - self._bookmakers_loaded_at >= BOOKMAKER_CATALOG_REFRESH_SECONDS:
+        # Casa nova no catalogo do Bet-Analytix: recarrega (no maximo 1x/min).
+        if time.monotonic() - getattr(self, "_bookmakers_loaded_at", 0.0) >= BOOKMAKER_CATALOG_REFRESH_SECONDS:
             logger.info("Casa '%s' nao encontrada; recarregando catalogo de casas.", bookmaker_name)
-            self._load_bookmakers(refresh=True)
-            resolved = self._match_bookmaker_name(bookmaker_name)
-            if resolved is not None:
-                return resolved
+            try:
+                self._load_bookmakers(refresh=True)
+            except Exception as exc:
+                logger.warning("Falha ao recarregar catalogo de casas: %s", exc)
+            strict = self._strict_bookmaker_match(bookmaker_name)
+            if strict is not None:
+                return self._remember_match(bookmaker_name, *strict)
 
-        normalized_input = _normalize_text(bookmaker_name)
-        closest = process.extract(
-            normalized_input,
-            list((self._bookmakers_by_name or {}).keys()),
-            scorer=fuzz.ratio,
-            limit=3,
-        )
+        best = self._best_effort_bookmaker(bookmaker_name)
+        if best is None:
+            # Catalogo vazio = API indisponivel; erro temporario (a fila faz retry),
+            # nao um pedido de correcao manual.
+            raise BetAnalytixWriterError(
+                f"Catalogo de casas do Bet-Analytix indisponivel; nova tentativa em breve ({bookmaker_name})."
+            )
+        bookmaker_id, matched_name, score = best
         logger.warning(
-            "Casa nao encontrada: entrada=%r normalizada=%r catalogo=%s nomes; mais proximas=%s",
+            "Casa pareada por aproximacao: '%s' -> '%s' (score=%.0f, id=%s).",
             bookmaker_name,
-            normalized_input,
-            len(self._bookmakers_by_name or {}),
-            [(name, round(score)) for name, score, _ in closest],
+            matched_name,
+            score,
+            bookmaker_id,
         )
-        raise BetAnalytixWriterError(f"Casa não encontrada no catálogo do Bet-Analytix: {bookmaker_name}")
+        return self._remember_match(bookmaker_name, bookmaker_id, "aproximado", score)
 
-    def _match_bookmaker_name(self, bookmaker_name: str) -> int | None:
-        if not self._bookmakers_by_name:
+    def _strict_bookmaker_match(self, bookmaker_name: str) -> tuple[int, str, float] | None:
+        """Exato (nome, sem dominio, com/sem "bet") antes de qualquer fuzzy."""
+
+        catalog = self._bookmakers_by_name or {}
+        if not catalog:
             return None
+        candidates = _bookmaker_input_candidates(bookmaker_name)
+        for candidate in candidates:
+            normalized = _normalize_text(candidate)
+            if normalized in catalog:
+                return catalog[normalized], "exato", 100.0
+        for candidate in candidates:
+            normalized = _normalize_text(candidate)
+            variant_id = self._resolve_bookmaker_id_bet_variant(candidate, normalized)
+            if variant_id is not None:
+                return variant_id, "exato", 100.0
+        for candidate in candidates:
+            normalized = _normalize_text(candidate)
+            fuzzy_id = self._resolve_bookmaker_id_fuzzy(candidate, normalized)
+            if fuzzy_id is not None:
+                matched = next((name for name, id_ in catalog.items() if id_ == fuzzy_id), normalized)
+                return fuzzy_id, "fuzzy", float(fuzz.ratio(normalized, matched))
+        return None
 
-        normalized_input = _normalize_text(bookmaker_name)
-        bookmaker_id = self._bookmakers_by_name.get(normalized_input)
-        if bookmaker_id is not None:
-            return bookmaker_id
+    def last_bookmaker_match(self, bookmaker_name: str) -> "BookmakerMatch | None":
+        return getattr(self, "_bookmaker_matches", {}).get(bookmaker_name)
 
-        bet_variant_id = self._resolve_bookmaker_id_bet_variant(bookmaker_name, normalized_input)
-        if bet_variant_id is not None:
-            return bet_variant_id
+    def _remember_match(self, source: str, bookmaker_id: int, method: str, score: float) -> "BookmakerMatch":
+        match = BookmakerMatch(
+            source_name=source,
+            bookmaker_id=int(bookmaker_id),
+            bookmaker_name=self.get_bookmaker_display_name(bookmaker_id) or str(bookmaker_id),
+            method=method,
+            score=float(score),
+        )
+        matches = getattr(self, "_bookmaker_matches", None)
+        if matches is None:
+            matches = self._bookmaker_matches = {}
+        if len(matches) > 500:
+            matches.clear()
+        matches[source] = match
+        return match
 
-        return self._resolve_bookmaker_id_fuzzy(bookmaker_name, normalized_input)
+    def get_bookmaker_display_name(self, bookmaker_id: int | str) -> str | None:
+        resolved_id = to_int(bookmaker_id)
+        names = getattr(self, "_bookmaker_display_names", None) or {}
+        if resolved_id in names:
+            return names[resolved_id]
+        for name, id_ in (self._bookmakers_by_name or {}).items():
+            if id_ == resolved_id:
+                return name
+        return None
+
+    def _load_bookmakers_fresh(self) -> None:
+        """Carrega o catalogo e o renova periodicamente (casas novas surgem sempre)."""
+
+        loaded_at = getattr(self, "_bookmakers_loaded_at", 0.0)
+        if self._bookmakers_by_name is None:
+            self._load_bookmakers()
+            return
+        if loaded_at and time.monotonic() - loaded_at >= BOOKMAKER_CATALOG_MAX_AGE_SECONDS:
+            try:
+                self._load_bookmakers(refresh=True)
+            except Exception as exc:
+                logger.warning("Falha ao renovar catalogo de casas; usando o atual: %s", exc)
+
+    def _best_effort_bookmaker(self, bookmaker_name: str) -> tuple[int, str, float] | None:
+        """Melhor candidato do catalogo, sem nota de corte."""
+
+        catalog = self._bookmakers_by_name or {}
+        if not catalog:
+            return None
+        choices = list(catalog.keys())
+        best: tuple[int, str, float] | None = None
+        for candidate in _bookmaker_input_candidates(bookmaker_name):
+            normalized = _normalize_text(candidate)
+            if not normalized:
+                continue
+            result = process.extractOne(normalized, choices, scorer=fuzz.WRatio)
+            if result is None:
+                continue
+            matched_name, score, _ = result
+            if best is None or score > best[2]:
+                best = (catalog[matched_name], matched_name, float(score))
+        return best
 
     def _resolve_bookmaker_id_bet_variant(self, bookmaker_name: str, normalized_input: str) -> int | None:
         """Tenta equivalencia exata adicionando ou removendo o sufixo ``bet``."""
@@ -1502,6 +1609,29 @@ def _extract_bookmaker_entries(payload: Any, only_bookmaker_keys: bool = False) 
     elif isinstance(payload, dict):
         walk(payload, 0, not only_bookmaker_keys)
     return entries
+
+
+def _bookmaker_input_candidates(value: str) -> list[str]:
+    """Nome original e versao sem www/dominio ("Stake.com" -> "Stake")."""
+
+    original = str(value or "").strip()
+    candidates = [original]
+    stripped = original.lower()
+    for prefix in ("https://", "http://", "www."):
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix):]
+    stripped = stripped.split("/", 1)[0]
+    changed = True
+    while changed:
+        changed = False
+        for suffix in _DOMAIN_SUFFIXES:
+            if stripped.endswith(suffix) and len(stripped) > len(suffix) + 1:
+                stripped = stripped[: -len(suffix)]
+                changed = True
+                break
+    if stripped and _normalize_text(stripped) != _normalize_text(original):
+        candidates.append(stripped)
+    return candidates
 
 
 def _bookmaker_id_from_text(value: str) -> int | None:

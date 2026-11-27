@@ -146,8 +146,60 @@ class BookmakerCatalogTests(unittest.TestCase):
 
         self.assertEqual(writer._resolve_bookmaker_id("Stake"), 2)
 
-    def test_unknown_bookmaker_still_raises(self) -> None:
-        writer = self._writer(public=[{"id": 1, "name": "Bet365"}], account={})
+    def test_unknown_bookmaker_gets_best_effort_match_flagged(self) -> None:
+        writer = self._writer(
+            public=[{"id": 1, "name": "Bet365"}, {"id": 2, "name": "Stake"}, {"id": 3, "name": "Superbet"}],
+            account={},
+        )
+
+        match = writer.match_bookmaker("Super Bet Brasil")
+
+        self.assertEqual(match.bookmaker_id, 3)
+        self.assertTrue(match.is_approximate)
+        self.assertIs(writer.last_bookmaker_match("Super Bet Brasil"), match)
+
+    def test_exact_match_is_not_flagged_and_keeps_display_name(self) -> None:
+        writer = self._writer(public=[{"id": 1135, "name": "99Play"}], account={})
+
+        match = writer.match_bookmaker("99play")
+
+        self.assertEqual((match.bookmaker_id, match.bookmaker_name, match.is_approximate), (1135, "99Play", False))
+
+    def test_domain_names_match_exactly(self) -> None:
+        writer = self._writer(
+            public=[{"id": 2, "name": "Stake"}, {"id": 7, "name": "Jogajunto"}, {"id": 1135, "name": "99play"}],
+            account={},
+        )
+        for name, expected in (("Stake.com", 2), ("jogajunto.bet.br", 7), ("www.99play.me", 1135)):
+            with self.subTest(name=name):
+                match = writer.match_bookmaker(name)
+                self.assertEqual(match.bookmaker_id, expected)
+                self.assertFalse(match.is_approximate)
+
+    def test_new_bookmaker_added_after_start_is_found(self) -> None:
+        public = [{"id": 1, "name": "Bet365"}]
+        writer = self._writer(public=public, account={})
+        writer._load_bookmakers()
+        writer._bookmakers_loaded_at -= 120
+        public.append({"id": 1135, "name": "99play"})
+
+        match = writer.match_bookmaker("99play")
+
+        self.assertEqual(match.bookmaker_id, 1135)
+        self.assertFalse(match.is_approximate)
+
+    def test_periodic_refresh_without_miss(self) -> None:
+        public = [{"id": 1, "name": "Bet365"}]
+        writer = self._writer(public=public, account={})
+        writer._load_bookmakers()
+        writer._bookmakers_loaded_at -= 7 * 3600
+
+        writer.match_bookmaker("Bet365")
+
+        self.assertEqual(writer.calls.count("/bookmakers"), 2)
+
+    def test_empty_catalog_still_raises(self) -> None:
+        writer = self._writer(public=[], account={})
 
         with self.assertRaises(BetAnalytixWriterError):
             writer._resolve_bookmaker_id("Casa Inexistente")
