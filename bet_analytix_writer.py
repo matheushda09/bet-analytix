@@ -45,6 +45,8 @@ class BetAnalytixWriter:
         self._fixed_destination_tipster_id: int | None = settings.copytrade_destination_tipster_id
         self._destination_user_id: int | None = None
         self._destination_tipsters_by_name: dict[str, int] | None = None
+        self._competition_ids: dict[tuple[str, int | None], int] = {}
+        self._competition_failures: set[tuple[str, int | None]] = set()
 
     def create_bet(self, tip: ParsedTelegramTip) -> list[dict[str, Any]]:
         """Registra a tip parseada na bankroll de destino."""
@@ -62,6 +64,7 @@ class BetAnalytixWriter:
         bookmaker_id = self._resolve_bookmaker_id(tip.bookmaker)
         sport_id = self._resolve_sport_id(tip.sport)
         tipster_id = self._resolve_destination_tipster_id(tip.tipster)
+        competition_id = self._resolve_competition_id_safely(tip.league, sport_id)
         event_date, event_time = self._bet_analytix_datetime_fields(tip.event_datetime)
         existing_bet_id = self.find_existing_matching_copytrade_bet(
             tip=tip,
@@ -92,7 +95,7 @@ class BetAnalytixWriter:
                     "status": 0,
                     "showDetails": False,
                     "category": None,
-                    "competition": _competition_value(tip),
+                    "competition": competition_id,
                     "betType": None,
                     "closing": None,
                     "estimatedProbability": None,
@@ -147,6 +150,7 @@ class BetAnalytixWriter:
         bookmaker_id = self._resolve_bookmaker_id(tip.bookmaker)
         sport_id = self._resolve_sport_id(tip.sport)
         tipster_id = self._resolve_destination_tipster_id(tip.tipster)
+        competition_id = self._resolve_competition_id_safely(tip.league, sport_id)
         event_date, event_time = self._bet_analytix_datetime_fields(tip.event_datetime)
         existing_bet_id = self.find_existing_matching_copytrade_bet(
             tip=tip,
@@ -175,7 +179,7 @@ class BetAnalytixWriter:
                     "sport": sport_id,
                     "status": 0,
                     "category": None,
-                    "competition": _competition_value(tip),
+                    "competition": competition_id,
                     "betType": None,
                     "closing": None,
                     "estimatedProbability": None,
@@ -381,9 +385,12 @@ class BetAnalytixWriter:
                 f"Aposta {bet_id} ja foi resolvida (state={state}); exclua manualmente se quiser."
             )
 
+        # Endpoint usado pelo app web (capturado via HAR):
+        # DELETE /bet/delete  {"bets": [id], "bankroll": <id publico da bankroll>}
         self._request_json(
             "DELETE",
-            f"/bet/{int(bet_id)}",
+            "/bet/delete",
+            json_payload={"bets": [int(bet_id)], "bankroll": int(self._settings.copytrade_bankroll_id)},
             authenticated=True,
             allow_existing_bet_delete=True,
         )
@@ -1054,6 +1061,72 @@ class BetAnalytixWriter:
         self._destination_user_id = user_id
         return user_id
 
+    def _resolve_competition_id_safely(self, league: str | None, sport_id: int | None) -> int | None:
+        """ID da competicao (campeonato) da conta; cria se nao existir.
+
+        No Bet-Analytix a competicao e um cadastro do usuario
+        (`{id, label, sport, country}` em all-data). Qualquer falha resulta
+        em aposta sem campeonato, nunca em aposta nao planilhada.
+        """
+
+        label = " ".join(str(league or "").split())
+        if not label:
+            return None
+        failures = getattr(self, "_competition_failures", set())
+        key = (_normalize_text(label), sport_id)
+        if key in failures:
+            return None
+        try:
+            competition_id = self._resolve_competition_id(label, sport_id)
+        except Exception as exc:
+            logger.warning("Campeonato '%s' nao resolvido; aposta seguira sem campeonato: %s", label, exc)
+            competition_id = None
+        if competition_id is None:
+            failures.add(key)
+            self._competition_failures = failures
+        return competition_id
+
+    def _resolve_competition_id(self, label: str, sport_id: int | None) -> int | None:
+        key = (_normalize_text(label), sport_id)
+        cache = getattr(self, "_competition_ids", None)
+        if cache is None:
+            cache = self._competition_ids = {}
+        if key in cache:
+            return cache[key]
+
+        found = self._find_competition_id(label, sport_id)
+        if found is None:
+            logger.info("Criando campeonato '%s' (sport=%s) no Bet-Analytix.", label, sport_id)
+            self._request_json(
+                "POST",
+                "/competition",
+                json_payload={"label": label, "sport": sport_id, "country": None},
+                authenticated=True,
+            )
+            found = self._find_competition_id(label, sport_id)
+        if found is not None:
+            cache[key] = found
+        return found
+
+    def _find_competition_id(self, label: str, sport_id: int | None) -> int | None:
+        user_id = self._resolve_destination_user_id()
+        all_data = self._request_json("GET", f"/bankroll/all-data/{user_id}", authenticated=True)
+        competitions = all_data.get("competitions") if isinstance(all_data, dict) else None
+        if not isinstance(competitions, list):
+            return None
+        normalized = _normalize_text(label)
+        same_label = [
+            item
+            for item in competitions
+            if isinstance(item, dict)
+            and not item.get("deleted_at")
+            and _normalize_text(str(item.get("label") or item.get("name") or "")) == normalized
+        ]
+        for item in same_label:
+            if sport_id is None or to_int(item.get("sport")) == sport_id:
+                return to_int(item.get("id"))
+        return None
+
     def _create_tipster(self, tipster_name: str) -> None:
         self._request_json(
             "POST",
@@ -1278,7 +1351,7 @@ class BetAnalytixWriter:
     ) -> None:
         """Bloqueia qualquer chamada capaz de apagar ou alterar apostas existentes.
 
-        Unica excecao destrutiva: `DELETE /bet/{id}` com flag explicita, usada
+        Unica excecao destrutiva: `DELETE /bet/delete` com flag explicita, usada
         apenas pelo ❌ do proprio usuario na DM de confirmacao daquela aposta.
 
         O CopyTrade so precisa ler referencias, criar uma aposta nova com
@@ -1296,8 +1369,9 @@ class BetAnalytixWriter:
                 return
             if allow_existing_bet_update and normalized_method == "PUT":
                 return
-            if allow_existing_bet_delete and normalized_method == "DELETE":
-                return
+
+        if allow_existing_bet_delete and normalized_method == "DELETE" and normalized_path == "/bet/delete":
+            return
 
         if normalized_method in {"DELETE", "PATCH", "PUT"}:
             raise BetAnalytixWriterError(f"Operacao Bet-Analytix bloqueada por seguranca: {method} {path}")
@@ -1494,11 +1568,6 @@ def _same_decimal(value: Any, expected: float, tolerance: float) -> bool:
     except (TypeError, ValueError):
         return False
     return abs(parsed - expected) <= tolerance
-
-
-def _competition_value(tip: ParsedTelegramTip) -> str | None:
-    league = (tip.league or "").strip()
-    return league or None
 
 
 def _is_client_error(exc: Exception) -> bool:

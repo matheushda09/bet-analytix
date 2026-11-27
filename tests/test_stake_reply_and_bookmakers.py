@@ -279,6 +279,7 @@ class CancelBetTests(unittest.TestCase):
         writer._settings = SimpleNamespace(copytrade_bankroll_internal_id=3, copytrade_bankroll_id=1829516)
         writer._access_token = "token"
         calls: list[tuple[str, str]] = []
+        state = {"deleted": False, "payload": None}
 
         def fake_request(method, path, json_payload=None, authenticated=False, **kwargs):
             writer._assert_non_destructive_request(
@@ -292,19 +293,23 @@ class CancelBetTests(unittest.TestCase):
             if method == "DELETE":
                 if delete_error:
                     raise BetAnalytixWriterError(delete_error)
+                state["deleted"] = True
+                state["payload"] = json_payload
                 return None
-            if method == "GET" and ("DELETE", path) in calls and not still_exists:
+            if method == "GET" and state["deleted"] and not still_exists:
                 raise BetAnalytixWriterError("Bet-Analytix retornou HTTP 404: not found")
             return raw_bet
 
         writer._request_json = fake_request
         writer.calls = calls
+        writer.delete_state = state
         return writer
 
     def test_deletes_pending_bet_of_this_bankroll(self) -> None:
         writer = self._writer({"state": 0, "bankroll": 3})
         writer.delete_pending_bet(555)
-        self.assertIn(("DELETE", "/bet/555"), writer.calls)
+        self.assertIn(("DELETE", "/bet/delete"), writer.calls)
+        self.assertEqual(writer.delete_state["payload"], {"bets": [555], "bankroll": 1829516})
 
     def test_refuses_settled_or_foreign_bets(self) -> None:
         for raw in ({"state": 1, "bankroll": 3}, {"state": 0, "bankroll": 99}):
@@ -312,12 +317,14 @@ class CancelBetTests(unittest.TestCase):
                 writer = self._writer(raw)
                 with self.assertRaises(BetAnalytixWriterError):
                     writer.delete_pending_bet(555)
-                self.assertNotIn(("DELETE", "/bet/555"), writer.calls)
+                self.assertNotIn(("DELETE", "/bet/delete"), writer.calls)
 
     def test_delete_still_blocked_without_explicit_flag(self) -> None:
         writer = object.__new__(BetAnalytixWriter)
         with self.assertRaises(BetAnalytixWriterError):
-            writer._assert_non_destructive_request("DELETE", "/bet/555")
+            writer._assert_non_destructive_request("DELETE", "/bet/delete")
+        with self.assertRaises(BetAnalytixWriterError):
+            writer._assert_non_destructive_request("DELETE", "/bet/555", allow_existing_bet_delete=True)
         with self.assertRaises(BetAnalytixWriterError):
             writer._assert_non_destructive_request("DELETE", "/bankroll/1", allow_existing_bet_delete=True)
 
@@ -374,3 +381,49 @@ class CancelBetTests(unittest.TestCase):
         asyncio.run(client._handle_dm_reaction(admin_payload))
         client._writer.delete_pending_bet.assert_called_once_with(555)
         client._store.cancel_planilhada_bet.assert_called_once_with(999, 1)
+
+
+class CompetitionResolutionTests(unittest.TestCase):
+    def _writer(self, competitions, create_fails=False):
+        writer = object.__new__(BetAnalytixWriter)
+        writer._destination_user_id = 690942
+        calls: list[tuple[str, str, object]] = []
+
+        def fake_request(method, path, json_payload=None, authenticated=False, **_kwargs):
+            calls.append((method, path, json_payload))
+            if method == "GET" and path == "/bankroll/all-data/690942":
+                return {"tipsters": [], "competitions": list(competitions)}
+            if method == "POST" and path == "/competition":
+                if create_fails:
+                    raise BetAnalytixWriterError("Bet-Analytix retornou HTTP 404: not found")
+                competitions.append({"id": 900, "label": json_payload["label"], "sport": json_payload["sport"]})
+                return {"id": 900}
+            raise AssertionError((method, path))
+
+        writer._request_json = fake_request
+        writer.calls = calls
+        return writer
+
+    def test_uses_existing_competition_id(self) -> None:
+        writer = self._writer([{"id": 231365, "label": "Brasileirão", "sport": 1, "deleted_at": None}])
+        self.assertEqual(writer._resolve_competition_id_safely("Brasileirao", 1), 231365)
+        self.assertFalse(any(method == "POST" for method, _, _ in writer.calls))
+
+    def test_creates_missing_competition_once(self) -> None:
+        writer = self._writer([])
+        self.assertEqual(writer._resolve_competition_id_safely("Liga Europa", 1), 900)
+        self.assertEqual(writer._resolve_competition_id_safely("Liga Europa", 1), 900)
+        posts = [payload for method, _, payload in writer.calls if method == "POST"]
+        self.assertEqual(posts, [{"label": "Liga Europa", "sport": 1, "country": None}])
+
+    def test_failure_returns_none_and_is_not_retried(self) -> None:
+        writer = self._writer([], create_fails=True)
+        self.assertIsNone(writer._resolve_competition_id_safely("NFL", 1))
+        self.assertIsNone(writer._resolve_competition_id_safely("NFL", 1))
+        posts = [payload for method, _, payload in writer.calls if method == "POST"]
+        self.assertEqual(len(posts), 1)
+
+    def test_empty_league(self) -> None:
+        writer = self._writer([])
+        self.assertIsNone(writer._resolve_competition_id_safely(None, 1))
+        self.assertEqual(writer.calls, [])
