@@ -51,6 +51,17 @@ CRYSTAL_BALL = "\U0001F52E"
 CALENDAR = "\U0001F4C6"
 VARIATION_SELECTOR = "\ufe0f"
 
+# Valor monetario: "R$27,00", "27,00" ou o formato em dolar com o valor em
+# reais entre parenteses, "US$4,59 (R$27,00)". A bankroll e em reais, entao o
+# valor usado e sempre o R$ (ver `_parse_brl_amount`).
+MONEY_NUMBER = r"[\d.,]+"
+STAKE_VALUE = (
+    rf"(?:US\$|U\$|\$)\s*{MONEY_NUMBER}\s*\(\s*R\$\s*{MONEY_NUMBER}\s*\)"
+    rf"|R\$\s*{MONEY_NUMBER}"
+    rf"|{MONEY_NUMBER}"
+)
+BRL_AMOUNT_PATTERN = re.compile(rf"R\$\s*(?P<value>{MONEY_NUMBER})", re.IGNORECASE)
+
 PATTERNS: dict[str, re.Pattern[str]] = {
     "bookmaker": re.compile(rf"^\s*{re.escape(HOUSE)}\s*(?P<value>[^\n\r]+)", re.MULTILINE),
     "event": re.compile(rf"^\s*{re.escape(VERSUS)}\s*(?P<value>[^\n\r]+)", re.MULTILINE),
@@ -61,12 +72,17 @@ PATTERNS: dict[str, re.Pattern[str]] = {
         re.IGNORECASE | re.MULTILINE,
     ),
     "edge": re.compile(rf"^\s*{re.escape(STOP_SIGN)}\s*(?P<value>[\d.,]+%)", re.MULTILINE),
-    "stake": re.compile(rf"^\s*{re.escape(MONEY_BAG)}\s*(?P<value>R\$\s*[\d.,]+|[\d.,]+)", re.MULTILINE),
+    "stake": re.compile(rf"^\s*{re.escape(MONEY_BAG)}\s*(?P<value>{STAKE_VALUE})\s*$", re.MULTILINE),
     "freebet": re.compile(rf"^\s*{re.escape(FREE_BUTTON)}\s*(?P<value>[^\n\r]+)", re.MULTILINE),
     "admin": re.compile(r"ADM\s*:\s*(?P<value>[^\n\r]+)", re.IGNORECASE),
+    # Aceita "📆 26/11/2026 14:45", "📆 26/11/2026 14h45" e a mesma linha sem
+    # o emoji (layout sem emojis). Exige que a data abra a linha para nao
+    # capturar textos como "Ja temos aposta enviada dia 26/11/2026".
     "event_datetime": re.compile(
-        rf"^\s*{re.escape(CALENDAR)}{VARIATION_SELECTOR}?\s*(?P<value>\d{{2}}/\d{{2}}/\d{{4}}\s+\d{{2}}:\d{{2}}(?::\d{{2}})?)",
-        re.MULTILINE,
+        rf"^\s*(?:{re.escape(CALENDAR)}{VARIATION_SELECTOR}?\s*)?"
+        r"(?P<date>\d{1,2}/\d{1,2}/\d{4})\s+(?:[àa]s\s+)?"
+        r"(?P<hour>\d{1,2})\s*(?:h|:)\s*(?P<minute>\d{2})?(?::(?P<second>\d{2}))?\s*$",
+        re.MULTILINE | re.IGNORECASE,
     ),
 }
 
@@ -77,18 +93,20 @@ OVERLOAD_TITLE_PATTERN = re.compile(
     r"^\s*(?:SOBRECARGA|\*\*SOBRECARGA\*\*|__SOBRECARGA__)\s*$",
     re.IGNORECASE,
 )
+# Layout posicional (sem emojis). Indices relativos a linha da casa; quando ha
+# o titulo SOBRECARGA ele ocupa a linha 0 e tudo e deslocado em uma linha.
 OVERLOAD_FIELD_LINES: dict[str, int] = {
-    "bookmaker": 1,
-    "event": 2,
-    "sport": 3,
-    "pick": 4,
-    "odd": 5,
-    "limit": 6,
-    "edge": 7,
-    "stake": 8,
-    "freebet": 9,
+    "bookmaker": 0,
+    "event": 1,
+    "sport": 2,
+    "pick": 3,
+    "odd": 4,
+    "limit": 5,
+    "edge": 6,
+    "stake": 7,
+    "freebet": 8,
 }
-OVERLOAD_ADMIN_START_LINE = 10
+OVERLOAD_ADMIN_START_LINE = 9
 OVERLOAD_FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
     "odd": re.compile(r"^\s*(?P<value>\d+(?:[.,]\d+)?)\s*$"),
     "limit": re.compile(
@@ -96,7 +114,7 @@ OVERLOAD_FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
         re.IGNORECASE,
     ),
     "edge": re.compile(r"^\s*(?P<value>[\d.,]+\s*%)\s*$"),
-    "stake": re.compile(r"^\s*(?P<value>R\$\s*[\d.,]+|[\d.,]+)\s*$", re.IGNORECASE),
+    "stake": re.compile(rf"^\s*(?P<value>{STAKE_VALUE})\s*$", re.IGNORECASE),
     "freebet": re.compile(r"^\s*(?P<value>Sim|N[aã]o)\s*$", re.IGNORECASE),
     "admin": re.compile(r"^\s*ADM\s*:\s*(?P<value>[^\n\r]+?)\s*$", re.IGNORECASE),
 }
@@ -135,9 +153,9 @@ def parse_external_signal(
         sport=_required(header, "sport"),
         pick=_required(header, "pick"),
         odd=_parse_odd(_required(header, "odd")),
-        stake=_parse_money(_required(header, "stake")),
+        stake=_parse_brl_amount(_required(header, "stake")),
         fair_odd=_optional_fair_odd(text),
-        limit=_required(header, "limit"),
+        limit=_normalize_limit(_required(header, "limit")),
         edge=_required(header, "edge"),
         freebet=_required(header, "freebet"),
         admin=_required(header, "admin"),
@@ -215,13 +233,18 @@ def _parse_event_datetime(text: str) -> datetime | None:
     match = PATTERNS["event_datetime"].search(text)
     if not match:
         return None
-    value = match.group("value").strip()
-    for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S"):
-        try:
-            return datetime.strptime(value, fmt)
-        except ValueError:
-            continue
-    return None
+    try:
+        day, month, year = (int(part) for part in match.group("date").split("/"))
+        return datetime(
+            year,
+            month,
+            day,
+            int(match.group("hour")),
+            int(match.group("minute") or 0),
+            int(match.group("second") or 0),
+        )
+    except ValueError:
+        return None
 
 
 def _required_header(text: str) -> str:
@@ -233,12 +256,12 @@ def _required_header(text: str) -> str:
 
 
 def _validate_header_layout(header: str) -> None:
-    if _is_overload_header(header):
+    if _is_positional_header(header):
         _validate_overload_header_layout(header)
         return
 
     lines = header.splitlines()
-    if len(lines) < 11:
+    if len(lines) < 10:
         raise UserbotSignalParseError("Cabecalho incompleto para sinal.")
 
     expected_patterns: tuple[tuple[int, str], ...] = (
@@ -250,7 +273,6 @@ def _validate_header_layout(header: str) -> None:
         (6, "edge"),
         (7, "stake"),
         (8, "freebet"),
-        (10, "admin"),
     )
     for index, field in expected_patterns:
         if index >= len(lines) or not PATTERNS[field].search(lines[index]):
@@ -259,12 +281,19 @@ def _validate_header_layout(header: str) -> None:
     if not _optional_sport(header):
         raise UserbotSignalParseError("Cabecalho fora do padrao na linha 3: sport")
 
-    if not lines[9].strip().startswith(CRYSTAL_BALL):
+    # O ADM vem logo apos o 🆓 (sinais do FishBot) ou apos uma linha 🔮.
+    if len(lines) == 10:
+        admin_index = 9
+    elif len(lines) == 11 and lines[9].strip().startswith(CRYSTAL_BALL):
+        admin_index = 10
+    else:
         raise UserbotSignalParseError("Cabecalho fora do padrao na linha 10: bloco de ADM")
+    if not PATTERNS["admin"].search(lines[admin_index]):
+        raise UserbotSignalParseError(f"Cabecalho fora do padrao na linha {admin_index + 1}: admin")
 
 
 def _optional(text: str, field: str) -> str | None:
-    if _is_overload_header(text):
+    if _is_positional_header(text):
         return _optional_overload_field(text, field)
 
     if field == "sport":
@@ -281,7 +310,7 @@ def _optional(text: str, field: str) -> str | None:
 def _optional_sport(text: str) -> str | None:
     """Extrai o esporte pela posicao estrutural, sem mapear emojis."""
 
-    if _is_overload_header(text):
+    if _is_positional_header(text):
         return _optional_overload_field(text, "sport")
 
     lines = text.splitlines()
@@ -302,27 +331,46 @@ def _is_overload_header(text: str) -> bool:
     return bool(lines and OVERLOAD_TITLE_PATTERN.fullmatch(lines[0]))
 
 
+def _is_positional_header(text: str) -> bool:
+    """Layout sem emojis: com titulo SOBRECARGA ou comecando direto pela casa.
+
+    Sinais sem emoji tambem chegam sem o titulo (ex.: tips convergentes do
+    FishBot). Nesse caso a validacao posicional estrita de todos os campos
+    (odd, limite, %, stake, freebet e ADM) e o que garante a seguranca.
+    """
+
+    if _is_overload_header(text):
+        return True
+    lines = text.splitlines()
+    return bool(lines) and not PATTERNS["bookmaker"].search(lines[0])
+
+
+def _positional_offset(lines: list[str]) -> int:
+    return 1 if lines and OVERLOAD_TITLE_PATTERN.fullmatch(lines[0]) else 0
+
+
 def _validate_overload_header_layout(header: str) -> None:
     """Valida o layout sem emojis identificado pelo titulo SOBRECARGA."""
 
     lines = header.splitlines()
-    if len(lines) < 11:
-        raise UserbotSignalParseError("Cabecalho SOBRECARGA incompleto para sinal.")
+    offset = _positional_offset(lines)
+    if len(lines) < OVERLOAD_ADMIN_START_LINE + offset + 1:
+        raise UserbotSignalParseError("Cabecalho sem emojis incompleto para sinal.")
 
     for field, line_index in OVERLOAD_FIELD_LINES.items():
         if not _optional_overload_field(header, field):
             raise UserbotSignalParseError(
-                f"Cabecalho SOBRECARGA fora do padrao na linha {line_index + 1}: {field}"
+                f"Cabecalho sem emojis fora do padrao na linha {line_index + offset + 1}: {field}"
             )
 
     admin_index = _overload_admin_line_index(lines)
     if admin_index is None:
-        raise UserbotSignalParseError("Cabecalho SOBRECARGA fora do padrao: admin")
+        raise UserbotSignalParseError("Cabecalho sem emojis fora do padrao: admin")
 
-    for line_index in range(OVERLOAD_ADMIN_START_LINE, admin_index):
+    for line_index in range(OVERLOAD_ADMIN_START_LINE + offset, admin_index):
         if not OVERLOAD_ATTRIBUTION_PATTERN.fullmatch(lines[line_index]):
             raise UserbotSignalParseError(
-                "Cabecalho SOBRECARGA contem metadado invalido "
+                "Cabecalho sem emojis contem metadado invalido "
                 f"antes do ADM na linha {line_index + 1}"
             )
 
@@ -335,6 +383,8 @@ def _optional_overload_field(text: str, field: str) -> str | None:
             return None
     else:
         line_index = OVERLOAD_FIELD_LINES.get(field)
+        if line_index is not None:
+            line_index += _positional_offset(lines)
 
     if line_index is None:
         return None
@@ -363,7 +413,7 @@ def _optional_overload_field(text: str, field: str) -> str | None:
 
 def _overload_admin_line_index(lines: list[str]) -> int | None:
     pattern = OVERLOAD_FIELD_PATTERNS["admin"]
-    for line_index in range(OVERLOAD_ADMIN_START_LINE, len(lines)):
+    for line_index in range(OVERLOAD_ADMIN_START_LINE + _positional_offset(lines), len(lines)):
         if pattern.fullmatch(lines[line_index]):
             return line_index
     return None
@@ -433,6 +483,31 @@ def _parse_odd(value: str) -> float:
         return float(value.replace(",", "."))
     except ValueError as exc:
         raise UserbotSignalParseError(f"Odd invalida: {value}") from exc
+
+
+def _parse_brl_amount(value: str) -> float:
+    """Converte o valor para reais.
+
+    A bankroll e em reais: em "US$4,59 (R$27,00)" o valor usado e o R$ entre
+    parenteses. Um valor somente em dolar e rejeitado para nao planilhar a
+    stake na moeda errada.
+    """
+
+    brl = BRL_AMOUNT_PATTERN.search(value)
+    if brl:
+        return _parse_money(brl.group("value"))
+    if "$" in value:
+        raise UserbotSignalParseError(f"Stake sem valor em reais: {value}")
+    return _parse_money(value)
+
+
+def _normalize_limit(value: str) -> str:
+    """Mantem so o limite em reais quando vier "US$x (R$y)"."""
+
+    brl = BRL_AMOUNT_PATTERN.search(value)
+    if brl and "(" in value:
+        return f"R${brl.group('value')}"
+    return value
 
 
 def _parse_money(value: str) -> float:

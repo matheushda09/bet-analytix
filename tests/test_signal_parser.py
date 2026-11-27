@@ -317,8 +317,22 @@ class SignalLayoutTests(unittest.TestCase):
                     )
                 )
 
-    def test_emoji_less_layout_requires_overload_title(self) -> None:
+    def test_emoji_less_layout_without_overload_title_is_accepted(self) -> None:
         text = OVERLOAD_SIGNAL.replace("SOBRECARGA\n\n", "", 1)
+
+        self.assertTrue(
+            is_external_signal_message(
+                text,
+                signal_marker_pattern=ODD_CHANGED_MARKER_PATTERN,
+            )
+        )
+        signal = self._parse(text)
+        self.assertEqual(signal.source_bookmaker, "Donald Bet")
+        self.assertEqual(signal.stake, 25.0)
+        self.assertEqual(signal.admin, "victylty")
+
+    def test_emoji_less_layout_without_title_rejects_shifted_fields(self) -> None:
+        text = OVERLOAD_SIGNAL.replace("SOBRECARGA\n\n", "", 1).replace("3.02\n", "", 1)
 
         self.assertFalse(
             is_external_signal_message(
