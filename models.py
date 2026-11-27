@@ -157,6 +157,7 @@ def parse_bet(
     bookmaker_names: dict[str, str],
     timezone_name: str,
     default_tipster_name: str,
+    competition_names: dict[int, str] | None = None,
 ) -> Bet:
     """Converte uma aposta bruta da API em uma estrutura pronta para notificação."""
 
@@ -178,7 +179,7 @@ def parse_bet(
         event_timestamp=timestamp,
         event_datetime=format_epoch(timestamp, timezone_name),
         sport=sport,
-        league=first_text(raw_bet, "competition", "category"),
+        league=_resolve_competition_name(first_text(raw_bet, "competition", "category"), competition_names or {}),
         event=first_text(raw_bet, "event", "match", "game"),
         pick=first_text(raw_bet, "label", "pick", "selection") or "Não informado",
         odd=as_text(raw_bet.get("odds")) or "Não informado",
@@ -186,6 +187,29 @@ def parse_bet(
         bookmaker=bookmaker,
         raw=raw_bet,
     )
+
+
+def build_competition_map(all_data_payload: dict[str, Any]) -> dict[int, str]:
+    """Mapa `id -> nome` das competicoes (campeonatos) da conta."""
+
+    result: dict[int, str] = {}
+    for item in all_data_payload.get("competitions") or []:
+        if not isinstance(item, dict):
+            continue
+        competition_id = to_int(item.get("id"))
+        label = as_text(item.get("label") or item.get("name"))
+        if competition_id is not None and label:
+            result[competition_id] = label
+    return result
+
+
+def _resolve_competition_name(value: str | None, competition_names: dict[int, str]) -> str | None:
+    """A API guarda o ID da competicao; troca pelo nome quando conhecido."""
+
+    competition_id = to_int(value) if value is not None and str(value).strip().isdigit() else None
+    if competition_id is not None:
+        return competition_names.get(competition_id) or None
+    return value
 
 
 def normalize_text(value: str | None) -> str:

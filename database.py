@@ -247,6 +247,13 @@ class BetStateStore:
                 (bet.id, bet.tipster_name, payload_json),
             )
 
+    def max_notified_bet_id(self) -> int | None:
+        """Maior ID de aposta ja visto (IDs do Bet-Analytix sao crescentes)."""
+
+        with self._connect() as connection:
+            row = connection.execute("SELECT MAX(bet_id) FROM notified_bets").fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
     def mark_many_as_seen(self, bets: Sequence[Bet]) -> int:
         """Registra várias apostas como vistas sem enviar notificação."""
 

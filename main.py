@@ -20,6 +20,7 @@ from models import (
     Bet,
     Tipster,
     build_bookmaker_map,
+    build_competition_map,
     build_tipster_map,
     filter_bets_by_tipsters,
     parse_bet,
@@ -46,6 +47,7 @@ class ReferenceCache:
     bookmaker_names: dict[str, str]
     target_tipster_ids: tuple[int, ...]
     refreshed_at_monotonic: float
+    competition_names: dict[int, str] | None = None
 
 
 class BetMonitor:
@@ -96,19 +98,43 @@ class BetMonitor:
 
         references = self._get_references()
         raw_bets = self._client.fetch_all_bets()
+        if self._has_unknown_competition(raw_bets, references):
+            # Campeonato criado depois do ultimo carregamento (ex.: pelo bot do Discord).
+            self._reference_cache = None
+            references = self._get_references()
         filtered_raw_bets = filter_bets_by_tipsters(
             raw_bets=raw_bets,
             tipsters_by_id=references.tipsters_by_id,
             target_names=self._settings.target_tipster_names,
             fallback_target_ids=references.target_tipster_ids,
         )
-        bets = self._parse_bets(filtered_raw_bets, references.tipsters_by_id, references.bookmaker_names)
+        bets = self._parse_bets(
+            filtered_raw_bets,
+            references.tipsters_by_id,
+            references.bookmaker_names,
+            references.competition_names or {},
+        )
         new_bets = [bet for bet in bets if not self._store.has_notified(bet.id)]
         new_bets.sort(key=lambda bet: bet.id)
 
         if not self._store.is_initialized():
             self._handle_first_successful_poll(new_bets)
             return
+
+        # IDs do Bet-Analytix sao crescentes: uma aposta "nao vista" com ID
+        # menor que o maior ja visto e antiga (ex.: entrou na pagina porque
+        # outra foi excluida). Marca como vista sem notificar.
+        max_seen = self._store.max_notified_bet_id()
+        if max_seen is not None:
+            old_bets = [bet for bet in new_bets if bet.id < max_seen]
+            if old_bets:
+                self._store.mark_many_as_seen(old_bets)
+                logger.info(
+                    "%s apostas antigas apareceram na listagem e foram ignoradas (ids %s).",
+                    len(old_bets),
+                    ", ".join(str(bet.id) for bet in old_bets[:10]),
+                )
+                new_bets = [bet for bet in new_bets if bet.id >= max_seen]
 
         if not new_bets:
             logger.info("Nenhuma aposta nova de %s.", self._target_label())
@@ -156,6 +182,7 @@ class BetMonitor:
         raw_bets: list[dict[str, Any]],
         tipsters_by_id: dict[int, Tipster],
         bookmaker_names: dict[str, str],
+        competition_names: dict[int, str] | None = None,
     ) -> list[Bet]:
         parsed: list[Bet] = []
         for raw_bet in raw_bets:
@@ -168,6 +195,7 @@ class BetMonitor:
                         bookmaker_names=bookmaker_names,
                         timezone_name=self._settings.timezone,
                         default_tipster_name=self._settings.target_tipster_name,
+                        competition_names=competition_names,
                     )
                 )
             except ValueError:
@@ -197,8 +225,20 @@ class BetMonitor:
             bookmaker_names=bookmaker_names,
             target_tipster_ids=target_tipster_ids,
             refreshed_at_monotonic=now,
+            competition_names=build_competition_map(all_data),
         )
         return self._reference_cache
+
+    @staticmethod
+    def _has_unknown_competition(raw_bets: list[dict[str, Any]], references: ReferenceCache) -> bool:
+        if time.monotonic() - references.refreshed_at_monotonic < 60:
+            return False
+        known = references.competition_names or {}
+        for raw_bet in raw_bets:
+            competition_id = to_int(raw_bet.get("competition"))
+            if competition_id is not None and competition_id not in known:
+                return True
+        return False
 
     def _fetch_bookmaker_names(self) -> dict[str, str]:
         """Busca nomes das casas e aplica sobrescritas opcionais do `.env`."""
