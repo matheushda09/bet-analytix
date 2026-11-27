@@ -254,6 +254,7 @@ class DiscordSignalClient(discord.Client):
             job_id = int(job["id"])
             source_bet_id = int(job["source_bet_id"])
             attempts = int(job["attempts"])
+            tip: ParsedTelegramTip | None = None
             try:
                 payload = json.loads(str(job["payload_json"]))
                 tip = tip_from_payload(payload)
@@ -264,9 +265,16 @@ class DiscordSignalClient(discord.Client):
                     response = await asyncio.to_thread(self._writer.create_bet, tip)
                 created_id = _extract_created_bet_id(response)
                 self._store.mark_job_success(job_id, created_id, response)
+            except Exception as exc:
+                await self._handle_job_failure(job, job_id, source_bet_id, attempts, tip, exc)
+                continue
+
+            # Daqui em diante a aposta JA esta no Bet-Analytix: nenhum erro
+            # secundario (agenda esportiva, alertas, DM) pode reenfileirar o job.
+            try:
                 if self._sports_event_service is not None:
                     next_check = self._sports_event_service.next_recheck_timestamp(
-                        tip.event_datetime,
+                        _datetime_as_utc(tip.event_datetime, self._base_settings.timezone),
                         None,
                     )
                     self._store.mark_sports_event_applied(
@@ -274,6 +282,12 @@ class DiscordSignalClient(discord.Client):
                         created_id,
                         next_check,
                     )
+            except Exception:
+                logger.exception(
+                    "Falha ao agendar recheck esportivo; aposta ja criada. source_bet_id=%s",
+                    source_bet_id,
+                )
+            try:
                 logger.info("Discord concluiu CopyTrade: source_bet_id=%s created_bet_id=%s", source_bet_id, created_id)
                 if attempts > 0:
                     await self._alert_async(
@@ -296,39 +310,56 @@ class DiscordSignalClient(discord.Client):
                     bet_analytix_bet_id=created_id,
                     already_exists=_response_already_exists(response),
                 )
-            except Exception as exc:
-                error_message = str(exc)
-                if _is_bookmaker_not_found_error(error_message):
-                    await self._ask_admin_for_bookmaker(job, tip, error_message)
-                    continue
-                if _is_unrecoverable_error(error_message):
-                    self._store.mark_job_failed(job_id, error_message)
-                    logger.error(
-                        "Job Discord source_bet_id=%s marcado como falha permanente: %s",
-                        source_bet_id,
-                        error_message,
-                    )
-                    await self._alert_async(
-                        "Discord descartou CopyTrade",
-                        f"source_bet_id={source_bet_id}\nerro={exc}",
-                        f"discord_failed_{source_bet_id}",
-                    )
-                    continue
-                delay = min(
-                    self._settings.retry_max_seconds,
-                    self._base_settings.backoff_initial_seconds * (2**attempts),
-                )
-                self._store.schedule_job_retry(job_id, error_message, delay_seconds=delay)
+            except Exception:
                 logger.exception(
-                    "Erro ao enviar job Discord source_bet_id=%s; reagendado em %.1fs.",
+                    "Falha em notificacoes apos criar aposta; job segue concluido. source_bet_id=%s",
                     source_bet_id,
-                    delay,
                 )
-                await self._alert_async(
-                    "Discord entrou em retry",
-                    f"source_bet_id={source_bet_id}\nattempts={attempts + 1}\nretry_em={delay:.1f}s\nerro={exc}",
-                    f"discord_retry_{source_bet_id}",
-                )
+
+    async def _handle_job_failure(
+        self,
+        job: sqlite3.Row,
+        job_id: int,
+        source_bet_id: int,
+        attempts: int,
+        tip: ParsedTelegramTip | None,
+        exc: Exception,
+    ) -> None:
+        """Erro ANTES da aposta ser criada: pergunta casa, descarta ou faz retry."""
+
+        error_message = str(exc)
+        if tip is not None and _is_bookmaker_not_found_error(error_message):
+            await self._ask_admin_for_bookmaker(job, tip, error_message)
+            return
+        if _is_unrecoverable_error(error_message):
+            self._store.mark_job_failed(job_id, error_message)
+            logger.error(
+                "Job Discord source_bet_id=%s marcado como falha permanente: %s",
+                source_bet_id,
+                error_message,
+            )
+            await self._alert_async(
+                "Discord descartou CopyTrade",
+                f"source_bet_id={source_bet_id}\nerro={exc}",
+                f"discord_failed_{source_bet_id}",
+            )
+            return
+        delay = min(
+            self._settings.retry_max_seconds,
+            self._base_settings.backoff_initial_seconds * (2**attempts),
+        )
+        self._store.schedule_job_retry(job_id, error_message, delay_seconds=delay)
+        logger.error(
+            "Erro ao enviar job Discord source_bet_id=%s; reagendado em %.1fs.",
+            source_bet_id,
+            delay,
+            exc_info=exc,
+        )
+        await self._alert_async(
+            "Discord entrou em retry",
+            f"source_bet_id={source_bet_id}\nattempts={attempts + 1}\nretry_em={delay:.1f}s\nerro={exc}",
+            f"discord_retry_{source_bet_id}",
+        )
 
     async def on_message(self, message: discord.Message) -> None:
         """Escuta respostas do admin e comandos de bankroll."""

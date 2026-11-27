@@ -213,3 +213,69 @@ class ReactionPolicyIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JobPostSuccessIntegrityTests(unittest.TestCase):
+    def _client(self, temp_dir, sports_side_effect):
+        from pathlib import Path
+
+        from discord_database import DiscordSignalStore
+        from discord_reaction_bot import DiscordSignalClient
+        from message_parser import ParsedTelegramTip
+
+        store = DiscordSignalStore(Path(temp_dir) / "signals.sqlite3")
+        store.initialize()
+        tip = ParsedTelegramTip(
+            tipster="PeixeEsperto",
+            event_datetime=datetime(2026, 11, 27, 20, 0),  # sem fuso, como vem do 📆
+            sport="Futebol",
+            league="Brasileirão Série B",
+            pick="Vila Nova x Atlético GO: Total de escanteios - Menos de 10,5",
+            odd=2.37,
+            stake=272.0,
+            bookmaker="99play",
+            source_bet_id=41957212639725010,
+            event="Vila Nova x Atlético GO",
+        )
+        store.enqueue_signal(1, 2, 3, 4, 5, tip, raw_message="sinal")
+
+        client = object.__new__(DiscordSignalClient)
+        client._store = store
+        client._settings = mock.Mock(queue_batch_size=5, retry_max_seconds=900)
+        client._base_settings = mock.Mock(timezone="America/Sao_Paulo", backoff_initial_seconds=2)
+        client._writer = mock.Mock()
+        client._writer.create_bet.return_value = [{"id": 123586562}]
+        client._sports_event_service = mock.Mock()
+        client._sports_event_service.next_recheck_timestamp.side_effect = sports_side_effect
+        client._notify_discord_success = mock.AsyncMock()
+        client._notify_success = mock.AsyncMock()
+        client._alert_async = mock.AsyncMock()
+        return client, store
+
+    def test_naive_event_datetime_is_converted_and_job_finishes(self) -> None:
+        import tempfile
+
+        def require_aware(starts_at, _status):
+            if starts_at.tzinfo is None:
+                raise ValueError("Datetime do serviço esportivo precisa possuir timezone.")
+            return 0
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client, store = self._client(temp_dir, require_aware)
+            asyncio.run(client.process_due_jobs_once())
+
+            self.assertEqual(store.get_job_by_message(1, 2, 3)["status"], "done")
+            client._notify_discord_success.assert_awaited_once()
+            starts_at = client._sports_event_service.next_recheck_timestamp.call_args.args[0]
+            self.assertEqual(starts_at, datetime(2026, 11, 27, 23, 0, tzinfo=timezone.utc))
+
+    def test_secondary_failure_after_creation_never_requeues(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client, store = self._client(temp_dir, RuntimeError("agenda fora do ar"))
+            asyncio.run(client.process_due_jobs_once())
+
+            self.assertEqual(store.get_job_by_message(1, 2, 3)["status"], "done")
+            client._writer.create_bet.assert_called_once()
+            client._notify_discord_success.assert_awaited_once()
