@@ -479,3 +479,37 @@ class CompetitionResolutionTests(unittest.TestCase):
         writer = self._writer([])
         self.assertIsNone(writer._resolve_competition_id_safely(None, 1))
         self.assertEqual(writer.calls, [])
+
+
+class AwaitingBookmakerRequeueTests(unittest.TestCase):
+    def test_recent_jobs_requeued_old_ones_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "signals.sqlite3"
+            store = DiscordSignalStore(path)
+            store.initialize()
+            for message_id in (3, 4):
+                tip = ParsedTelegramTip(
+                    tipster="PeixeEsperto",
+                    event_datetime=datetime.now(timezone.utc),
+                    sport="Futebol",
+                    league=None,
+                    pick="A x B: A",
+                    odd=2.0,
+                    stake=27,
+                    bookmaker="99play",
+                    source_bet_id=message_id,
+                    event="A x B",
+                )
+                store.enqueue_signal(1, 2, message_id, 4, 5, tip, raw_message="sinal")
+                store.mark_job_awaiting_bookmaker(store.get_job_by_message(1, 2, message_id)["id"], "?")
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute("UPDATE discord_signal_jobs SET created_at_ts = 0 WHERE message_id = 4")
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(store.requeue_jobs_awaiting_bookmaker(), (1, 1))
+            self.assertEqual(store.get_job_by_message(1, 2, 3)["status"], "retry")
+            self.assertEqual(store.get_job_by_message(1, 2, 4)["status"], "failed")
+            self.assertEqual(store.get_jobs_awaiting_bookmaker(), [])

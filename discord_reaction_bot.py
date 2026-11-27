@@ -139,6 +139,16 @@ class DiscordSignalClient(discord.Client):
     async def setup_hook(self) -> None:
         """Inicializa tarefas de fundo depois que o cliente esta pronto."""
 
+        try:
+            requeued, expired = self._store.requeue_jobs_awaiting_bookmaker()
+            if requeued or expired:
+                logger.info(
+                    "Jobs aguardando casa: %s reenfileirados para o novo pareamento, %s antigos encerrados.",
+                    requeued,
+                    expired,
+                )
+        except Exception:
+            logger.exception("Falha ao reenfileirar jobs aguardando casa.")
         self._processor_task = asyncio.create_task(self.process_due_loop(), name="discord-signal-queue")
         if self._bankroll_settings is not None and self._bankroll_settings.enabled:
             self._bankroll_scheduler_task = asyncio.create_task(

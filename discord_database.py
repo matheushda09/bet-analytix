@@ -562,6 +562,35 @@ class DiscordSignalStore:
                 (question[:1000], now + 7 * 86400, now, job_id),
             )
 
+    def requeue_jobs_awaiting_bookmaker(self, max_age_seconds: int = 86400) -> tuple[int, int]:
+        """Devolve a fila os jobs parados aguardando casa; encerra os antigos.
+
+        Retorna (reenfileirados, encerrados).
+        """
+
+        now = int(time.time())
+        cutoff = now - int(max_age_seconds)
+        with self._connect() as connection:
+            requeued = connection.execute(
+                """
+                UPDATE discord_signal_jobs
+                SET status = 'retry', next_attempt_ts = ?, updated_at_ts = ?
+                WHERE status = 'awaiting_bookmaker' AND created_at_ts >= ?
+                """,
+                (now, now, cutoff),
+            ).rowcount
+            expired = connection.execute(
+                """
+                UPDATE discord_signal_jobs
+                SET status = 'failed',
+                    last_error = 'Aguardava correcao de casa ha mais de 24h; encerrado.',
+                    updated_at_ts = ?
+                WHERE status = 'awaiting_bookmaker' AND created_at_ts < ?
+                """,
+                (now, cutoff),
+            ).rowcount
+        return int(requeued or 0), int(expired or 0)
+
     def get_jobs_awaiting_bookmaker(self, limit: int = 10) -> list[sqlite3.Row]:
         """Retorna jobs que estao aguardando correcao do nome da bookmaker."""
 
